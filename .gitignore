@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.local
+.venv/
+__pycache__/
+MovieManager/
+logs/
+temp/
+work/
+certs/
+bootstrap/managemovie.env
+bootstrap/managemovie.sql
+bootstrap/proxmox.env
