@@ -1,4 +1,4 @@
-# ManageMovie LXS 0.2.44
+# ManageMovie LXS 0.2.45
 
 ManageMovie LXS ist das eigenständige Container-Repository für den Betrieb auf Proxmox LXC. Dieses Repo enthält nur den LXC-Teil und hat keine Abhängigkeit zum Mac-Hauptrepo-Deployment.
 
@@ -36,6 +36,34 @@ Das Repo ist für eine leere Kundeninstallation ohne vorgefüllte API-Keys ausge
 - Erst danach wird der produktive Jobstart freigeschaltet.
 - Die Checkbox `Beim Booten starten` ist standardmäßig aktiv und steuert den systemweiten Start beim Container-Boot.
 
+## Betriebsrealität
+- Operativer Master-Container ist aktuell `CT240` mit Hostname `mamo` auf `pve01`.
+- `CT240` ist die reale Quellinstanz fuer releasefaehigen LXS-Code. Repo-Aenderungen koennen aus dem laufenden Containerstand nach Git zurueckgespiegelt werden.
+- `CT240` ist kein Git-Checkout. Der Container haelt einen aus Releases synchronisierten Arbeitsbaum unter `/opt/managemovie`.
+- Worker laufen aktuell als eigene LXC-Container:
+- `mamow01` auf `pve01` als `CT241`
+- `mamow02` auf `pve02` als `CT242`
+- `mamow03` auf `pve03` als `CT243`
+- `mamow04` auf `pve04` als `CT244`
+
+## Release-Workflow
+- Releases werden als Git-Tags `v<version>` im Repo `ManageMovie-LXS` veroeffentlicht.
+- Der reale Ablauf ist:
+- releasefaehige Dateien aus `CT240` pruefen und bei Bedarf ins Git-Repo spiegeln
+- Versionsnummer anheben
+- committen und Tag `v<version>` pushen
+- `CT240` via `./update_ManageMovie.sh --tag v<version>` auf genau dieses Tag ziehen
+- Worker mit demselben Self-Update-Befehl auf dasselbe Tag ziehen
+- Verifiziert am 2026-03-28: Release `v0.2.45`, danach `CT240` und `CT241-244` auf `0.2.45`
+
+## Worker-Lifecycle
+- `Kill` entfernt einen Worker-Container vollstaendig.
+- `Init` restauriert den Worker aus dem neuesten frischen `CT240`-Backup auf `pve01`.
+- Gesucht wird `/mnt/pve/nfs/dump/vzdump-lxc-240-*.tar.zst`.
+- Ist das neueste Backup juenger als 24 Stunden, wird genau dieses fuer `pct restore` verwendet.
+- Gibt es kein frisches Backup, erzeugt die App zuerst eins via `vzdump 240 --storage nfs --mode snapshot --compress zstd --stdout 0`.
+- Verifiziert am 2026-03-28: frisches Basis-Backup `vzdump-lxc-240-2026_03_28-23_35_29.tar.zst`
+
 ## Sicherheitsregel
 - Live-Secrets und API-Keys werden nicht im Git-Repo abgelegt.
 - API-Keys werden beim Erststart in der Web-UI eingetragen.
@@ -48,3 +76,4 @@ Das Repo ist für eine leere Kundeninstallation ohne vorgefüllte API-Keys ausge
 - Boot-Check: `scripts/check_start_on_boot.sh`
 - Runner: `managemovie-web/app/managemovie.py`
 - Web-App: `managemovie-web/web/app.py`
+- Worker-Restore-Logik: `managemovie-web/web/app.py`

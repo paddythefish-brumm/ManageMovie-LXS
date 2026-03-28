@@ -5,7 +5,7 @@ macOS helper script to pick a folder in Finder and save its directory tree
 into a temp file. Designed to run inside a virtual environment; will warn
 if not.
 
-Version: 0.2.44
+Version: 0.2.45
 """
 import argparse
 import csv
@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 from mmcore.db_cache import GeminiDbStore
 
-VERSION = "0.2.44"
+VERSION = "0.2.45"
 SCRIPT_NAME = f"managemovie_v{VERSION}.py"
 TMDB_ENABLED = (os.environ.get("MANAGEMOVIE_TMDB_ENABLED", "1") or "1").strip().lower() in {
     "1",
@@ -7200,6 +7200,39 @@ def normalized_series_key(name: str) -> str:
     return cleaned
 
 
+def _title_variant_distance_lte_one(left: str, right: str) -> bool:
+    a = normalize_match_token(left)
+    b = normalize_match_token(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+
+    i = 0
+    j = 0
+    diffs = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        diffs += 1
+        if diffs > 1:
+            return False
+        if len(a) > len(b):
+            i += 1
+        elif len(b) > len(a):
+            j += 1
+        else:
+            i += 1
+            j += 1
+
+    diffs += (len(a) - i) + (len(b) - j)
+    return diffs <= 1
+
+
 def apply_series_metadata(row: dict[str, str]) -> None:
     series_key = normalized_series_key(row.get("Name des Film/Serie", ""))
     meta = SERIES_METADATA.get(series_key)
@@ -7283,6 +7316,15 @@ def harmonize_series_titles(rows: list[dict[str, str]]) -> None:
             canonical = max(source_titles.items(), key=_title_rank)[0]
         elif fallback_titles:
             canonical = max(fallback_titles.items(), key=_title_rank)[0]
+
+        source_canonical = max(source_titles.items(), key=_title_rank)[0] if source_titles else ""
+        if source_canonical:
+            if not canonical:
+                canonical = source_canonical
+            elif _title_variant_distance_lte_one(source_canonical, canonical):
+                # Prefer the source-derived series title when the current group title
+                # only differs by a tiny artifact such as a dropped leading letter.
+                canonical = source_canonical
 
         if not canonical:
             continue
