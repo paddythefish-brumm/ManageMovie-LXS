@@ -1,4 +1,4 @@
-# Bootstrap (0.2.43)
+# Bootstrap (0.2.44)
 
 Dieses Verzeichnis enthält nur nicht-sensitive Beispielkonfigurationen für den LXC-Betrieb.
 

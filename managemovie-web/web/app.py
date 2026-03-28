@@ -3931,15 +3931,101 @@ def _read_worker_live_status(worker_host: str) -> tuple[str, dict[str, str]]:
     return text, snapshot
 
 
+def _format_gb_two_decimals(size_bytes: int) -> str:
+    try:
+        value = max(0, int(size_bytes)) / (1024.0 ** 3)
+    except Exception:
+        return ""
+    return f"{value:.2f}"
+
+
+def _read_remote_target_size_gb(worker_host: str, remote_target_path: str) -> str:
+    host = str(worker_host or "").strip()
+    target = str(remote_target_path or "").strip()
+    if not host or not target:
+        return ""
+    result = run_worker_ssh(
+        host,
+        f"if [ -f {shlex.quote(target)} ]; then stat -c%s {shlex.quote(target)} 2>/dev/null || wc -c < {shlex.quote(target)} 2>/dev/null; fi",
+        timeout=4,
+    )
+    raw = str(result.stdout or "").strip()
+    match = re.search(r"\d+", raw)
+    if not match:
+        return ""
+    try:
+        size_bytes = int(match.group(0))
+    except Exception:
+        return ""
+    if size_bytes <= 0:
+        return ""
+    return _format_gb_two_decimals(size_bytes)
+
+
+def _looks_encode_speed(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text.endswith("x")
+
+
+def _looks_non_encode_speed(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text.endswith("mb/s") or text.endswith("mib/s") or text in {"copied", "encoded"}
+
+
+def _looks_encode_fps(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return bool(text) and text not in {"n/a", "na", "-"}
+
+
+def _looks_percent_metric(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text.endswith("%")
+
+
+def _prefer_live_completed_metrics(base: dict[str, str], preferred: dict[str, str], q_gb: Any = "") -> dict[str, str]:
+    out = dict(base or {})
+    pref = {key: str((preferred or {}).get(key, "") or "").strip() for key in ("speed", "fps", "z_gb", "e_gb", "eta", "lzeit")}
+    if _looks_non_encode_speed(out.get("speed", "")) and _looks_encode_speed(pref.get("speed", "")):
+        out["speed"] = pref["speed"]
+    if not _looks_encode_fps(out.get("fps", "")) and _looks_encode_fps(pref.get("fps", "")):
+        out["fps"] = pref["fps"]
+    if (_looks_percent_metric(out.get("e_gb", "")) or not str(out.get("e_gb", "") or "").strip()) and str(pref.get("e_gb", "") or "").strip():
+        out["e_gb"] = pref["e_gb"]
+    if (not str(out.get("eta", "") or "").strip() or str(out.get("eta", "") or "").strip().lower() in {"n/a", "-", "na"}) and str(pref.get("eta", "") or "").strip():
+        out["eta"] = pref["eta"]
+    if (not str(out.get("lzeit", "") or "").strip() or str(out.get("lzeit", "") or "").strip().lower() in {"n/a", "-", "na"}) and str(pref.get("lzeit", "") or "").strip():
+        out["lzeit"] = pref["lzeit"]
+    z_text = str(out.get("z_gb", "") or "").strip()
+    z_num = _to_float(z_text)
+    pref_z = str(pref.get("z_gb", "") or "").strip()
+    pref_z_num = _to_float(pref_z)
+    if pref_z_num > z_num:
+        out["z_gb"] = pref_z
+    q_num = _to_float(q_gb)
+    z_final = _to_float(out.get("z_gb", ""))
+    if q_num > 0 and z_final >= 0:
+        saved_pct = max(0.0, ((q_num - z_final) / q_num) * 100.0)
+        out["e_gb"] = f"{int(round(saved_pct))}%"
+    return out
+
+
 def _read_worker_job_metrics(item: dict[str, Any]) -> dict[str, str]:
     worker_host = str(item.get("worker_host", "") or "").strip()
     worker_name = str(item.get("worker_name", "") or "").strip()
     source_name = str(item.get("source_name", "") or "").strip()
     remote_log_path = str(item.get("remote_log_path", "") or "").strip()
+    remote_target_path = str(item.get("remote_target_path", "") or "").strip()
     local_log_path = Path(str(item.get("log_path", "") or "").strip() or ".")
     running = bool(item.get("running"))
+    live_metrics = {
+        key: str((item.get("last_live_metrics", {}) or {}).get(key, "") or "").strip()
+        for key in ("speed", "fps", "z_gb", "e_gb", "eta", "lzeit")
+    }
     cache_key = _worker_metric_cache_key(worker_name, source_name)
     cached_metrics = dict(WORKER_METRIC_CACHE.get(cache_key, {"speed": "", "fps": "", "z_gb": "", "e_gb": "", "eta": ""}))
+    for key, value in live_metrics.items():
+        if value and not str(cached_metrics.get(key, "") or "").strip():
+            cached_metrics[key] = value
     status_metrics, _ = _read_worker_status_metrics(item)
     if (
         status_metrics.get("speed")
@@ -3986,6 +4072,8 @@ def _read_worker_job_metrics(item: dict[str, Any]) -> dict[str, str]:
                 parsed_fps = str(metrics.get("fps", "") or "").strip().lower()
                 cached_speed = str(cached_metrics.get("speed", "") or "").strip().lower()
                 cached_fps = str(cached_metrics.get("fps", "") or "").strip().lower()
+                live_speed = str(live_metrics.get("speed", "") or "").strip().lower()
+                live_fps = str(live_metrics.get("fps", "") or "").strip().lower()
                 parsed_looks_non_encode = (
                     parsed_speed in {"copied", "encoded"}
                     or parsed_speed.endswith("mb/s")
@@ -3996,11 +4084,13 @@ def _read_worker_job_metrics(item: dict[str, Any]) -> dict[str, str]:
                     cached_speed.endswith("x")
                     or (cached_fps not in {"", "n/a"} and bool(cached_fps))
                 )
-                if not running and parsed_looks_non_encode and cached_looks_encode:
-                    merged = dict(metrics)
-                    for key in ("speed", "fps", "z_gb", "e_gb", "eta"):
-                        if str(cached_metrics.get(key, "") or "").strip():
-                            merged[key] = str(cached_metrics.get(key, "") or "").strip()
+                live_looks_encode = (
+                    live_speed.endswith("x")
+                    or (live_fps not in {"", "n/a"} and bool(live_fps))
+                )
+                if not running and parsed_looks_non_encode and (cached_looks_encode or live_looks_encode):
+                    preferred = cached_metrics if cached_looks_encode else live_metrics
+                    merged = _prefer_live_completed_metrics(dict(metrics), preferred, item.get("q_gb", ""))
                     WORKER_METRIC_CACHE[cache_key] = dict(merged)
                     return merged
                 merged = _merge_worker_metric_sources(
@@ -4008,6 +4098,8 @@ def _read_worker_job_metrics(item: dict[str, Any]) -> dict[str, str]:
                     status_metrics=status_metrics,
                     job_metrics=metrics,
                 )
+                if not running and int(item.get("exit_code", 1) or 1) == 0:
+                    merged = _prefer_live_completed_metrics(merged, cached_metrics if cached_looks_encode else live_metrics, item.get("q_gb", ""))
                 WORKER_METRIC_CACHE[cache_key] = dict(merged)
                 return merged
     except Exception:
@@ -4017,6 +4109,8 @@ def _read_worker_job_metrics(item: dict[str, Any]) -> dict[str, str]:
         status_metrics=status_metrics,
         job_metrics=cached_metrics,
     )
+    if not running and int(item.get("exit_code", 1) or 1) == 0:
+        merged = _prefer_live_completed_metrics(merged, live_metrics, item.get("q_gb", ""))
     WORKER_METRIC_CACHE[cache_key] = dict(merged)
     return merged
 
@@ -4065,10 +4159,11 @@ def _build_dispatch_status_index() -> dict[str, dict[str, Any]]:
         source_name = str(item.get("source_name", "") or "").strip()
         if not worker_name or not source_name:
             continue
+        running = bool(item.get("running"))
         status_metrics, snapshot = _read_worker_status_metrics(item)
         job_metrics = _read_worker_job_metrics(item)
         metrics = _merge_worker_metric_sources(
-            running=bool(item.get("running")),
+            running=running,
             status_metrics=status_metrics,
             job_metrics=job_metrics,
         )
@@ -4123,6 +4218,7 @@ def annotate_runtime_rows_with_dispatch_status(rows: list[dict[str, Any]]) -> li
     annotated: list[dict[str, Any]] = []
     for row in rows:
         out = dict(row)
+        out["completed"] = False
         match: dict[str, Any] | None = None
         for key in _dispatch_row_match_keys(out.get("source_name", ""), out.get("target_name", "")):
             candidate = status_index.get(key)
@@ -4151,6 +4247,7 @@ def annotate_runtime_rows_with_dispatch_status(rows: list[dict[str, Any]]) -> li
                     max(0.0, float(match.get("ended_at", 0.0) or 0.0) - float(match.get("started_at", 0.0) or 0.0))
                 )
                 if exit_code in (0, "0"):
+                    out["completed"] = True
                     if match.get("speed"):
                         out["speed"] = str(match.get("speed", "") or "").strip()
                     if match.get("fps"):
@@ -4205,10 +4302,16 @@ def build_worker_job_map() -> dict[str, list[dict[str, Any]]]:
         eta_text = str((snapshot or {}).get("eta", "") or metrics.get("eta", "") or "").strip()
         z_gb_text = str((snapshot or {}).get("z_gb", "") or metrics.get("z_gb", "") or "").strip()
         e_gb_text = str((snapshot or {}).get("e_gb", "") or metrics.get("e_gb", "") or "").strip()
-        if live_matches or (bool(item.get("running")) and not speed_text and bool(live_worker.get("active_count", 0))):
+        if live_matches or (running and not speed_text and bool(live_worker.get("active_count", 0))):
             speed_text = speed_text or str(live_worker.get("active_speed", "") or "").strip()
             fps_text = fps_text or str(live_worker.get("active_fps", "") or "").strip()
             eta_text = eta_text or str(live_worker.get("active_eta", "") or "").strip()
+            z_gb_text = z_gb_text or str(live_worker.get("active_z_gb", "") or "").strip()
+            e_gb_text = e_gb_text or str(live_worker.get("active_e_gb", "") or "").strip()
+        if running and (_to_float(z_gb_text) <= 0.0) and remote_target_path:
+            remote_z = _read_remote_target_size_gb(worker_host, remote_target_path)
+            if _to_float(remote_z) > 0.0:
+                z_gb_text = remote_z
         e_gb_text = _fallback_live_e_gb(item.get("q_gb", ""), e_gb_text, running=bool(item.get("running")))
         grouped.setdefault(worker_name, []).append(
             {
@@ -5161,13 +5264,19 @@ def launch_remote_ffmpeg_subjob(
     worker_name = str(worker.get("name", "") or "").strip()
     job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     log_path = LOG_DIR / f"managemovie-{job_id}.log"
+    remote_folder = map_folder_for_ffmpeg_worker(str(folder_path), worker)
+    remote_target_path = ""
+    raw_target_name = str((row or {}).get("target_name", "") or "").strip()
+    if raw_target_name:
+        target_path = Path(raw_target_name)
+        remote_target_path = str((Path(remote_folder) / target_path).as_posix()) if not target_path.is_absolute() else str(target_path)
     cmd, worker_host, remote_log_path, remote_rc_path, remote_pid_path = build_remote_ffmpeg_subjob_launcher(
         str(folder_path), env, worker, source_name, job_id
     )
     log_handle = log_path.open("a", encoding="utf-8")
     log_handle.write(f"$ {' '.join(cmd)}\n")
     log_handle.write(f"[info] started={time.strftime('%Y-%m-%d %H:%M:%S')} mode=ffmpeg folder={folder_path}\n")
-    log_handle.write(f"[worker] ffmpeg-remote host={worker_name} folder={map_folder_for_ffmpeg_worker(str(folder_path), worker)} source={source_name}\n")
+    log_handle.write(f"[worker] ffmpeg-remote host={worker_name} folder={remote_folder} source={source_name}\n")
     log_handle.write(f"[version] release={release_version} range={format_release_version(VERSION_MIN_PATCH)}..{format_release_version(VERSION_MAX_PATCH)}\n")
     log_handle.flush()
     launch_result = subprocess.run(
@@ -5201,6 +5310,7 @@ def launch_remote_ffmpeg_subjob(
         "job_id": job_id,
         "source_name": source_name,
         "target_name": str((row or {}).get("target_name", "") or "").strip(),
+        "remote_target_path": remote_target_path,
         "worker_name": worker_name,
         "worker_host": worker_host,
         "remote_pid": remote_pid,
@@ -5247,6 +5357,17 @@ def spawn_dispatch_subjob_monitor(job_id: str) -> None:
                 last_forwarded_lines = current_lines
             _, snapshot = _read_worker_status_metrics(item)
             if snapshot:
+                with dispatch_lock:
+                    current = dispatch_subjobs.get(job_id)
+                    if current is not None:
+                        current["last_live_metrics"] = {
+                            "speed": str(snapshot.get("speed", "") or "").strip(),
+                            "fps": str(snapshot.get("fps", "") or "").strip(),
+                            "z_gb": str(snapshot.get("z_gb", "") or "").strip(),
+                            "e_gb": str(snapshot.get("e_gb", "") or "").strip(),
+                            "eta": str(snapshot.get("eta", "") or "").strip(),
+                            "lzeit": str(snapshot.get("lzeit", "") or "").strip(),
+                        }
                 signature = "|".join(
                     [
                         str(snapshot.get("target", "") or "").strip(),
@@ -5517,13 +5638,8 @@ def build_dispatch_status_table_text(start_folder: str) -> str:
         except Exception:
             return 0.0
 
-    running_rows = [row for row in annotated_rows if str(row.get("eta", "") or "").strip().lower() not in {"", "encoded", "copied", "manual", "error"}]
-    completed_rows = [
-        row
-        for row in annotated_rows
-        if str(row.get("eta", "") or "").strip().lower() in {"encoded", "copied", "manual"}
-        or str(row.get("speed", "") or "").strip().lower() in {"encoded", "copied", "manual"}
-    ]
+    running_rows = [row for row in annotated_rows if not bool(row.get("completed")) and str(row.get("eta", "") or "").strip().lower() not in {"", "encoded", "copied", "manual", "error"}]
+    completed_rows = [row for row in annotated_rows if bool(row.get("completed"))]
     active_row = None
     active_index = 0
     for candidate in running_rows:
@@ -6850,12 +6966,13 @@ def api_state():
             job_data = fallback_job_data()
     dispatch_data = dispatch_job_data()
     if dispatch_data:
+        local_running = bool(job_data.get("running"))
         dispatch_running = bool(dispatch_data.get("running"))
         dispatch_started = float(dispatch_data.get("started_at") or 0.0)
         dispatch_ended = float(dispatch_data.get("ended_at") or 0.0)
         local_started = float(job_data.get("started_at") or 0.0)
         local_ended = float(job_data.get("ended_at") or 0.0)
-        if (
+        if not local_running and (
             dispatch_running
             or dispatch_started >= local_started
             or dispatch_ended >= local_ended
@@ -15608,6 +15725,10 @@ TEMPLATE = """
       const headers = Array.isArray(parsed.headers) ? parsed.headers : [];
       const qIdx = findStatusColumnIndex(headers, ['qgb', 'q']);
       const zIdx = findStatusColumnIndex(headers, ['zgb', 'z-gb']);
+      const eIdx = findStatusColumnIndex(headers, ['egb', 'e-gb']);
+      const speedIdx = findStatusColumnIndex(headers, ['speed']);
+      const etaIdx = findStatusColumnIndex(headers, ['eta']);
+      const fpsIdx = findStatusColumnIndex(headers, ['fps']);
       const lines = [];
       const ratio = isoAnalyzeActive
         ? (isoProgress.ratio || progress.activeRatio || activeMeta.ratio || '-')
@@ -15625,13 +15746,30 @@ TEMPLATE = """
       const totalRows = Number(progress.totalRows || rows.length || 0);
       const filesQ = `${totalRows}/${totalRows}`;
       const completedRows = rows.filter((row) => !!(row && row.completed));
-      const filesZ = `${Number(completedRows.length || 0)}/${totalRows}`;
+      const startedRows = rows.filter((row) => {
+        if (!row) return false;
+        if (row.completed) return true;
+        const cells = Array.isArray(row.cells) ? row.cells : [];
+        const speedText = speedIdx >= 0 ? String(cells[speedIdx] || '').trim() : '';
+        const etaText = etaIdx >= 0 ? String(cells[etaIdx] || '').trim() : '';
+        const fpsText = fpsIdx >= 0 ? String(cells[fpsIdx] || '').trim() : '';
+        const zVal = zIdx >= 0 ? parseSizeGbValue(cells[zIdx] || '') : null;
+        const eVal = eIdx >= 0 ? parseSizeGbValue(cells[eIdx] || '') : null;
+        return (
+          !isMissingUiMetric(speedText)
+          || !isMissingUiMetric(etaText)
+          || !isMissingUiMetric(fpsText)
+          || (zVal !== null && zVal > 0)
+          || (eVal !== null && eVal > 0)
+        );
+      });
+      const filesZ = `${Number(startedRows.length || 0)}/${totalRows}`;
       if (isoAnalyzeActive && isoProgress.qGb !== null) {
         lines.push(`GB Quelle: ${formatSizeGb(isoProgress.qGb)}`);
         if (isoProgress.zGb !== null) lines.push(`GB Ziel: ${formatSizeGb(isoProgress.zGb)}`);
       } else {
         lines.push(`GB Quelle: ${formatSizeGb(progress.qTotalGb)} (${filesQ})`);
-        const zTotal = rows.reduce((sum, row) => {
+        const zTotal = startedRows.reduce((sum, row) => {
           const cells = row && Array.isArray(row.cells) ? row.cells : [];
           const value = zIdx >= 0 ? parseSizeGbValue(cells[zIdx] || '') : null;
           return sum + (value !== null ? value : 0);
@@ -15639,18 +15777,24 @@ TEMPLATE = """
         if (mode === 'c' || mode === 'f') lines.push(`GB Ziel: ${formatSizeGb(zTotal)} (${filesZ})`);
       }
       if (mode === 'f') {
-        const qDone = completedRows.reduce((sum, row) => {
+        const qStarted = startedRows.reduce((sum, row) => {
           const cells = row && Array.isArray(row.cells) ? row.cells : [];
           const value = qIdx >= 0 ? parseSizeGbValue(cells[qIdx] || '') : null;
           return sum + (value !== null ? value : 0);
         }, 0);
-        const zDone = completedRows.reduce((sum, row) => {
+        const projectedZ = startedRows.reduce((sum, row) => {
           const cells = row && Array.isArray(row.cells) ? row.cells : [];
-          const value = zIdx >= 0 ? parseSizeGbValue(cells[zIdx] || '') : null;
-          return sum + (value !== null ? value : 0);
+          const qVal = qIdx >= 0 ? parseSizeGbValue(cells[qIdx] || '') : null;
+          const zVal = zIdx >= 0 ? parseSizeGbValue(cells[zIdx] || '') : null;
+          const eVal = eIdx >= 0 ? parseSizeGbValue(cells[eIdx] || '') : null;
+          if (row.completed) return sum + (zVal !== null ? zVal : 0);
+          if (eVal !== null && eVal > 0) return sum + eVal;
+          if (zVal !== null && zVal > 0) return sum + zVal;
+          if (qVal !== null && qVal > 0) return sum + qVal;
+          return sum;
         }, 0);
-        const savedGbNum = Math.max(0, qDone - zDone);
-        const pctText = qDone > 0 ? `${Math.round((savedGbNum / qDone) * 100)}%` : '';
+        const savedGbNum = Math.max(0, qStarted - projectedZ);
+        const pctText = qStarted > 0 ? `${Math.round((savedGbNum / qStarted) * 100)}%` : '';
         lines.push(`Ersparnis: ${formatSizeGb(savedGbNum)}${pctText ? ` | ${pctText}` : ''}`);
       }
       lines.push(`Laufzeit: ${isoAnalyzeActive && isoProgress.runtime ? isoProgress.runtime : laufz}`);

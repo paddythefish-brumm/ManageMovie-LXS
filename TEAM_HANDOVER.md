@@ -1,10 +1,10 @@
-Version: 0.2.43
+Version: 0.2.44
 
 # Team Handover ManageMovie LXS
 
 ## Abgabestand
 - Repo-Typ: eigenständiges LXC-Repo
-- Version: `0.2.43`
+- Version: `0.2.44`
 - Plattform: Proxmox LXC auf Debian 13
 
 ## Kernpfade

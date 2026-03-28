@@ -1,4 +1,4 @@
-# ManageMovie LXS 0.2.43
+# ManageMovie LXS 0.2.44
 
 ManageMovie LXS ist das eigenständige Container-Repository für den Betrieb auf Proxmox LXC. Dieses Repo enthält nur den LXC-Teil und hat keine Abhängigkeit zum Mac-Hauptrepo-Deployment.
 
