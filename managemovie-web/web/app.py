@@ -729,6 +729,8 @@ def display_target_reenqueue_path(start_folder: str, target_reenqueue_value: str
 
 def init_state_store() -> bool:
     global STATE_DB_READY, STATE_DB_FAILED, STATE_DB_RETRY_AFTER
+    if parse_form_bool(os.environ.get("MANAGEMOVIE_SKIP_DB_INIT", "0")):
+        return False
     if STATE_DB_READY:
         return True
     now = time.time()
@@ -3173,6 +3175,43 @@ def current_release_version() -> str:
     if last < VERSION_MIN_PATCH:
         return format_release_version(VERSION_MIN_PATCH)
     return format_release_version(last)
+
+
+def highest_release_version(values: list[str]) -> str:
+    best_patch = -1
+    for value in values:
+        patch = parse_release_patch(str(value or "").strip())
+        if patch > best_patch:
+            best_patch = patch
+    if best_patch < VERSION_MIN_PATCH:
+        return ""
+    return format_release_version(best_patch)
+
+
+def latest_known_release_version(project_root: Path | None = None) -> str:
+    root = project_root or BASE_DIR.parent
+    commands = (
+        ["git", "-C", str(root), "ls-remote", "--tags", "--refs", "origin", "v*"],
+        ["git", "-C", str(root), "tag", "--list", "v*"],
+    )
+    candidates: list[str] = []
+    for cmd in commands:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+        for raw_line in (result.stdout or "").splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            for match in re.finditer(r"\bv(\d+\.\d+\.\d+)\b", line):
+                version = str(match.group(1) or "").strip()
+                if parse_release_patch(version) >= VERSION_MIN_PATCH:
+                    candidates.append(version)
+    return highest_release_version(candidates)
+
 
 def extract_release_from_log(log_path: str) -> str:
     if not log_path:
@@ -6216,6 +6255,8 @@ def schedule_system_update() -> tuple[bool, str]:
     update_log = LOG_DIR / "system-update.log"
     update_debug_log = LOG_DIR / "system-update-debug.log"
     update_log.parent.mkdir(parents=True, exist_ok=True)
+    current_version = current_release_version()
+    target_version = latest_known_release_version(project_root)
 
     python_bin = (sys.executable or shutil.which("python3") or "python3").strip() or "python3"
     app_script = Path(__file__).resolve()
@@ -6225,6 +6266,8 @@ def schedule_system_update() -> tuple[bool, str]:
     q_debug_log = shlex.quote(str(update_debug_log))
     q_python = shlex.quote(str(python_bin))
     q_app = shlex.quote(str(app_script))
+    q_current_version = shlex.quote(current_version)
+    q_target_version = shlex.quote(target_version)
 
     shell_script = f"""#!/usr/bin/env bash
 set +e
@@ -6232,12 +6275,14 @@ sleep 1
 cd {q_project_root}
 : > {q_log}
 : > {q_debug_log}
+current_version={q_current_version}
+target_version={q_target_version}
 log_line() {{
   printf '%s\\n' "$1" >> {q_log}
 }}
 run_update_phase() {{
   local phase="$1"
-  {q_python} - {q_app} "$phase" >> {q_log} 2>&1 <<'PY'
+  MANAGEMOVIE_SKIP_DB_INIT=1 {q_python} - {q_app} "$phase" >> {q_log} 2>&1 <<'PY'
 import importlib.util
 import pathlib
 import sys
@@ -6268,6 +6313,14 @@ PY
 }}
 log_line "[`date '+%Y-%m-%d %H:%M:%S'`] Update gestartet"
 log_line "[update-status] running"
+if [ -n "$current_version" ]; then
+  log_line "[update] Aktuell installiert: v$current_version"
+fi
+if [ -n "$target_version" ]; then
+  log_line "[update] Ziel-Release: v$target_version"
+else
+  log_line "[update] Ziel-Release wird geprüft"
+fi
 if [ -f {q_update} ] && [ ! -x {q_update} ]; then
   chmod +x {q_update} >> {q_debug_log} 2>&1 || true
 fi
@@ -6284,7 +6337,11 @@ if [ "$rc" -ne 0 ]; then
   log_line "[update-status] done rc=$rc"
   exit $rc
 fi
-log_line "[update] Das neue Release wird eingespielt"
+if [ -n "$target_version" ]; then
+  log_line "[update] Das Release v$target_version wird eingespielt"
+else
+  log_line "[update] Das neue Release wird eingespielt"
+fi
 {q_update} >> {q_debug_log} 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then
@@ -6296,7 +6353,25 @@ if [ "$rc" -ne 0 ]; then
   log_line "[update-status] done rc=$rc"
   exit $rc
 fi
-log_line "[update] Das Release ist installiert"
+installed_version=$({q_python} - <<'PY'
+import pathlib
+import re
+
+path = pathlib.Path("app/managemovie.py")
+try:
+    text = path.read_text(encoding="utf-8", errors="replace")
+except Exception:
+    raise SystemExit(0)
+match = re.search(r'^VERSION\\s*=\\s*"((?:\\d+\\.){{2}}\\d+)"\\s*$', text, flags=re.MULTILINE)
+if match:
+    print(match.group(1), end="")
+PY
+)
+if [ -n "$installed_version" ]; then
+  log_line "[update] Installiert: v$installed_version"
+else
+  log_line "[update] Das Release ist installiert"
+fi
 log_line "[update] Backup und Worker-Neustart laufen"
 run_update_phase post
 rc=$?
@@ -15205,26 +15280,30 @@ TEMPLATE = """
       if (el) el.innerText = normalizeDisplayUmlauts(String(message || '').trim());
     }
 
-    function setUpdateProgressLog(text = '') {
-      const el = document.getElementById('updateProgressPre');
+    function updateScrollableLogElement(el, text = '') {
       if (!el) return;
       const next = String(text || '').trim();
-      const nearBottom = (el.scrollTop + el.clientHeight + 40) >= el.scrollHeight;
+      const prevScrollTop = el.scrollTop;
+      const prevScrollHeight = el.scrollHeight;
+      const nearBottom = (prevScrollTop + el.clientHeight + 40) >= prevScrollHeight;
       el.innerText = next || '(leer)';
       if (nearBottom) {
         el.scrollTop = el.scrollHeight;
+        return;
       }
+      const newScrollHeight = el.scrollHeight;
+      const delta = Math.max(0, newScrollHeight - prevScrollHeight);
+      el.scrollTop = prevScrollTop + delta;
+    }
+
+    function setUpdateProgressLog(text = '') {
+      const el = document.getElementById('updateProgressPre');
+      updateScrollableLogElement(el, text);
     }
 
     function setUpdateProgressDebugLog(text = '') {
       const el = document.getElementById('updateProgressDebugPre');
-      if (!el) return;
-      const next = String(text || '').trim();
-      const nearBottom = (el.scrollTop + el.clientHeight + 40) >= el.scrollHeight;
-      el.innerText = next || '(leer)';
-      if (nearBottom) {
-        el.scrollTop = el.scrollHeight;
-      }
+      updateScrollableLogElement(el, text);
     }
 
     function setUpdateAbortButtonState(running, done, canAbort = false) {
@@ -18107,9 +18186,9 @@ TEMPLATE = """
 
     function parseDurationSeconds(raw = '') {
       const text = String(raw || '').trim();
-      let m = text.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+      let m = text.match(/^(\\d{1,2}):(\\d{2}):(\\d{2})$/);
       if (m) return (Number(m[1]) * 3600) + (Number(m[2]) * 60) + Number(m[3]);
-      m = text.match(/^(\d{1,2}):(\d{2})$/);
+      m = text.match(/^(\\d{1,2}):(\\d{2})$/);
       if (m) return (Number(m[1]) * 60) + Number(m[2]);
       return null;
     }

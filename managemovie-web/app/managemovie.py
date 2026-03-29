@@ -5,7 +5,7 @@ macOS helper script to pick a folder in Finder and save its directory tree
 into a temp file. Designed to run inside a virtual environment; will warn
 if not.
 
-Version: 0.2.49
+Version: 0.2.50
 """
 import argparse
 import csv
@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 from mmcore.db_cache import GeminiDbStore
 
-VERSION = "0.2.49"
+VERSION = "0.2.50"
 SCRIPT_NAME = f"managemovie_v{VERSION}.py"
 TMDB_ENABLED = (os.environ.get("MANAGEMOVIE_TMDB_ENABLED", "1") or "1").strip().lower() in {
     "1",
