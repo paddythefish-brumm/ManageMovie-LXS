@@ -3704,13 +3704,19 @@ def _merge_worker_metric_sources(
     return merged
 
 
-def _fallback_live_e_gb(q_gb_text: Any, e_gb_text: Any, *, running: bool) -> str:
+def _fallback_live_e_gb(q_gb_text: Any, z_gb_text: Any, e_gb_text: Any, *, running: bool) -> str:
     q_text = str(q_gb_text or "").strip()
+    z_text = str(z_gb_text or "").strip()
     e_text = str(e_gb_text or "").strip()
+    q_num = _metric_to_float(q_text)
+    z_num = _metric_to_float(z_text)
+    if q_num > 0 and z_num > 0:
+        saved_pct = max(0.0, ((q_num - z_num) / q_num) * 100.0)
+        return f"{int(round(saved_pct))}%"
     if e_text and e_text.lower() != "n/a":
+        if running and q_num > 0 and _metric_to_float(e_text) >= q_num and z_num <= 0.0:
+            return ""
         return e_text
-    if running and q_text:
-        return q_text
     return e_text
 
 
@@ -3803,6 +3809,75 @@ def _parse_status_eta_minutes(text: str) -> int:
         return int(m.group(1)) * 60 + int(m.group(2))
     except Exception:
         return -1
+
+
+def parse_eta_seconds_text(text: str) -> float:
+    raw = str(text or "").strip()
+    if not raw:
+        return 0.0
+    m = re.match(r"^(\d+):(\d+):(\d+)$", raw)
+    if m:
+        try:
+            return float(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)))
+        except Exception:
+            return 0.0
+    m = re.match(r"^(\d+):(\d+)$", raw)
+    if m:
+        try:
+            return float(int(m.group(1)) * 60 + int(m.group(2)))
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def format_total_eta(total_seconds: Any) -> str:
+    try:
+        seconds = max(0, int(float(total_seconds or 0)))
+    except Exception:
+        return ""
+    if seconds >= 3600:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    minutes = seconds // 60
+    secs = seconds % 60
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def estimate_dispatch_total_eta_seconds(rows: list[dict[str, Any]]) -> float:
+    safe_rows = [dict(row) for row in (rows or []) if isinstance(row, dict)]
+    total = len(safe_rows)
+    if total <= 0:
+        return 0.0
+    completed_rows = [row for row in safe_rows if bool(row.get("completed"))]
+    active_rows = [
+        row for row in safe_rows
+        if not bool(row.get("completed"))
+        and str(row.get("speed", "") or "").strip().lower() not in {"", "-", "n/a", "na"}
+        and str(row.get("eta", "") or "").strip().lower() not in {"", "-", "n/a", "na"}
+    ]
+    active_eta_values = [parse_eta_seconds_text(str(row.get("eta", "") or "").strip()) for row in active_rows]
+    active_eta_values = [value for value in active_eta_values if value > 0]
+    completed_durations = [parse_eta_seconds_text(str(row.get("eta", "") or "").strip()) for row in completed_rows]
+    completed_durations = [value for value in completed_durations if value > 0]
+    active_count = len(active_rows)
+    remaining_queued = max(0, total - len(completed_rows) - active_count)
+
+    avg_duration = 0.0
+    if completed_durations:
+        avg_duration = sum(completed_durations) / len(completed_durations)
+    elif active_eta_values:
+        avg_duration = sum(active_eta_values) / len(active_eta_values)
+
+    slot_count = max(active_count, len(active_eta_values), 1)
+    loads = list(active_eta_values) if active_eta_values else [avg_duration if avg_duration > 0 else 0.0] * slot_count
+    if not loads:
+        loads = [0.0]
+    for _ in range(remaining_queued):
+        min_index = min(range(len(loads)), key=lambda idx: loads[idx])
+        loads[min_index] += avg_duration if avg_duration > 0 else 0.0
+    return max(loads) if loads else 0.0
 
 
 def _build_live_status_rows_from_workers(worker_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4121,6 +4196,45 @@ def _read_remote_target_size_gb(worker_host: str, remote_target_path: str) -> st
     return _format_gb_two_decimals(size_bytes)
 
 
+def _read_local_target_size_gb(target_path: Any) -> str:
+    raw = str(target_path or "").strip()
+    if not raw:
+        return ""
+    try:
+        path = Path(raw).expanduser()
+    except Exception:
+        return ""
+    if not path.is_absolute():
+        return ""
+    try:
+        if not path.exists() or not path.is_file():
+            return ""
+        return _format_gb_two_decimals(path.stat().st_size)
+    except Exception:
+        return ""
+
+
+def _resolve_best_target_size_gb(*candidates: Any, worker_host: str = "") -> str:
+    best_text = ""
+    best_value = 0.0
+    for candidate in candidates:
+        size_text = _read_local_target_size_gb(candidate)
+        size_value = _metric_to_float(size_text)
+        if size_value > best_value:
+            best_text = size_text
+            best_value = size_value
+    if best_value > 0.0:
+        return best_text
+    if worker_host:
+        for candidate in candidates:
+            size_text = _read_remote_target_size_gb(worker_host, str(candidate or "").strip())
+            size_value = _metric_to_float(size_text)
+            if size_value > best_value:
+                best_text = size_text
+                best_value = size_value
+    return best_text
+
+
 def _looks_encode_speed(value: Any) -> bool:
     text = str(value or "").strip().lower()
     return text.endswith("x")
@@ -4425,7 +4539,20 @@ def _build_dispatch_status_index() -> dict[str, dict[str, Any]]:
             entry["fps"] = str(entry.get("fps") or live_worker.get("active_fps", "") or "").strip()
             entry["eta"] = str(entry.get("eta") or live_worker.get("active_eta", "") or "").strip()
             entry["target_name"] = str(entry.get("target_name") or live_target or "").strip()
-        entry["e_gb"] = _fallback_live_e_gb(entry.get("q_gb", ""), entry.get("e_gb", ""), running=bool(entry.get("running")))
+        target_size = _resolve_best_target_size_gb(
+            str(item.get("remote_target_path", "") or "").strip(),
+            str(item.get("target_name", "") or "").strip(),
+            str(entry.get("target_name", "") or "").strip(),
+            worker_host=str(item.get("worker_host", "") or "").strip(),
+        )
+        if _metric_to_float(target_size) > _metric_to_float(entry.get("z_gb", "")):
+            entry["z_gb"] = target_size
+        entry["e_gb"] = _fallback_live_e_gb(
+            entry.get("q_gb", ""),
+            entry.get("z_gb", ""),
+            entry.get("e_gb", ""),
+            running=bool(entry.get("running")),
+        )
         for key in _dispatch_row_match_keys(source_name, entry.get("target_name", "")):
             prev = grouped.get(key)
             if not prev or _dispatch_item_precedence_key(entry) > _dispatch_item_precedence_key(prev):
@@ -4455,7 +4582,15 @@ def annotate_runtime_rows_with_dispatch_status(rows: list[dict[str, Any]]) -> li
                 out["target_name"] = str(match.get("target_name", "") or "").strip()
             if match.get("z_gb"):
                 out["z_gb"] = str(match.get("z_gb", "") or "").strip()
-            out["e_gb"] = _fallback_live_e_gb(out.get("q_gb", ""), match.get("e_gb", ""), running=bool(match.get("running")))
+            target_size = _resolve_best_target_size_gb(str(out.get("target_name", "") or "").strip())
+            if _metric_to_float(target_size) > _metric_to_float(out.get("z_gb", "")):
+                out["z_gb"] = target_size
+            out["e_gb"] = _fallback_live_e_gb(
+                out.get("q_gb", ""),
+                out.get("z_gb", ""),
+                match.get("e_gb", ""),
+                running=bool(match.get("running")),
+            )
             if match.get("lzeit"):
                 out["lzeit"] = str(match.get("lzeit", "") or "").strip()
             if match.get("running"):
@@ -4483,6 +4618,16 @@ def annotate_runtime_rows_with_dispatch_status(rows: list[dict[str, Any]]) -> li
                 elif exit_code not in (None, "", "-"):
                     out["speed"] = "error"
                     out["eta"] = duration_text or "error"
+        else:
+            target_size = _resolve_best_target_size_gb(str(out.get("target_name", "") or "").strip())
+            if _metric_to_float(target_size) > _metric_to_float(out.get("z_gb", "")):
+                out["z_gb"] = target_size
+            out["e_gb"] = _fallback_live_e_gb(
+                out.get("q_gb", ""),
+                out.get("z_gb", ""),
+                out.get("e_gb", ""),
+                running=not bool(out.get("completed")),
+            )
         annotated.append(out)
     return annotated
 
@@ -4505,6 +4650,7 @@ def build_worker_job_map() -> dict[str, list[dict[str, Any]]]:
         running = bool(item.get("running"))
         worker_host = str(item.get("worker_host", "") or "").strip()
         remote_target_path = str(item.get("remote_target_path", "") or "").strip()
+        item_target_name = str(item.get("target_name", "") or "").strip()
         status_metrics, snapshot = _read_worker_status_metrics(item)
         job_metrics = _read_worker_job_metrics(item)
         metrics = _merge_worker_metric_sources(
@@ -4537,16 +4683,21 @@ def build_worker_job_map() -> dict[str, list[dict[str, Any]]]:
             eta_text = eta_text or str(live_worker.get("active_eta", "") or "").strip()
             z_gb_text = z_gb_text or str(live_worker.get("active_z_gb", "") or "").strip()
             e_gb_text = e_gb_text or str(live_worker.get("active_e_gb", "") or "").strip()
-        if running and (_metric_to_float(z_gb_text) <= 0.0) and remote_target_path:
-            remote_z = _read_remote_target_size_gb(worker_host, remote_target_path)
-            if _metric_to_float(remote_z) > 0.0:
-                z_gb_text = remote_z
-        e_gb_text = _fallback_live_e_gb(item.get("q_gb", ""), e_gb_text, running=running)
+        target_size = _resolve_best_target_size_gb(
+            remote_target_path,
+            item_target_name,
+            str((snapshot or {}).get("target", "") or "").strip(),
+            str(live_target or "").strip(),
+            worker_host=worker_host,
+        )
+        if _metric_to_float(target_size) > _metric_to_float(z_gb_text):
+            z_gb_text = target_size
+        e_gb_text = _fallback_live_e_gb(item.get("q_gb", ""), z_gb_text, e_gb_text, running=running)
         grouped.setdefault(worker_name, []).append(
             {
                 "source_name": source_name,
                 "file_name": Path(source_name).name,
-                "target_name": str((snapshot or {}).get("target", "") or item.get("target_name", "") or live_target or "").strip(),
+                "target_name": str(item_target_name or (snapshot or {}).get("target", "") or live_target or "").strip(),
                 "running": running,
                 "exit_code": item.get("exit_code"),
                 "speed": speed_text,
@@ -6072,7 +6223,8 @@ def build_dispatch_status_table_text(start_folder: str) -> str:
     active_ratio = f"{active_index:02d}/{total:02d}" if active_index else f"00/{total:02d}"
     q_total = sum(_to_float(row.get("q_gb", "")) for row in annotated_rows)
     z_done = sum(_to_float(row.get("z_gb", "")) for row in completed_rows + running_rows)
-    active_eta = str((active_row or {}).get("eta", "") or "").strip() or "-"
+    total_eta_seconds = estimate_dispatch_total_eta_seconds(annotated_rows)
+    active_eta = format_total_eta(total_eta_seconds) if total_eta_seconds > 0 else (str((active_row or {}).get("eta", "") or "").strip() or "-")
     meta_lines = [
         f"Aktiv:      {active_ratio} {active_target}".rstrip(),
         "",
@@ -7747,7 +7899,9 @@ def api_state():
             job_data["_live_worker_fallback"] = True
             live_worker_fallback = True
     folder_hint = str(job_data.get("folder", "") or "").strip()
-    dispatch_status_table = build_dispatch_status_table_text(folder_hint)
+    job_mode = str(job_data.get("mode", "") or "").strip().lower()
+    allow_dispatch_status = job_mode in {"copy", "ffmpeg"} or bool(active_workers) or live_worker_fallback
+    dispatch_status_table = build_dispatch_status_table_text(folder_hint) if allow_dispatch_status else ""
     dispatch_status_matches_live = _status_text_covers_active_workers(dispatch_status_table, worker_states)
     if active_workers and bool(job_data.get("running")):
         if dispatch_status_table and dispatch_status_matches_live:
@@ -10303,7 +10457,15 @@ LOG_WINDOW_TEMPLATE = """
       return `/api/state?${params.toString()}`;
     }
 
-    async function refreshNow() {
+    let refreshNowInFlight = false;
+    let refreshNowQueued = false;
+
+    async function refreshNow(force = false) {
+      if (refreshNowInFlight && !force) {
+        refreshNowQueued = true;
+        return;
+      }
+      refreshNowInFlight = true;
       try {
         const res = await fetch(stateApiUrl(), { cache: "no-store" });
         const data = await res.json();
@@ -10355,6 +10517,12 @@ LOG_WINDOW_TEMPLATE = """
           return;
         }
         setText(`Fehler beim Laden: ${err}`);
+      } finally {
+        refreshNowInFlight = false;
+        if (refreshNowQueued) {
+          refreshNowQueued = false;
+          window.setTimeout(() => refreshNow(true), 0);
+        }
       }
     }
 
@@ -10387,10 +10555,10 @@ LOG_WINDOW_TEMPLATE = """
       updateStatusFilterButton();
       updatePageTitle();
       refreshNow();
-      setInterval(refreshNow, 1000);
+      setInterval(() => refreshNow(), 2500);
       window.addEventListener('storage', (event) => {
         if (event && event.key === 'managemovie.ui.refresh') {
-          refreshNow();
+          refreshNow(true);
         }
       });
     }
@@ -16714,7 +16882,7 @@ TEMPLATE = """
         }, 0);
         const savedGbNum = Math.max(0, qStarted - projectedZ);
         const pctText = qStarted > 0 ? `${Math.round((savedGbNum / qStarted) * 100)}%` : '';
-        lines.push(`Ersparnis: ${formatSizeGb(savedGbNum)}${pctText ? ` | ${pctText}` : ''}`);
+        lines.push(`Ersparnis: ${formatSizeGb(savedGbNum)}${pctText ? ` (${pctText})` : ''}`);
       }
       lines.push(`Laufzeit: ${isoAnalyzeActive && isoProgress.runtime ? isoProgress.runtime : laufz}`);
       let etaText = String(meta['ETA:'] || '').trim() || '-';
@@ -18849,12 +19017,20 @@ TEMPLATE = """
 
     function mainStateApiUrl() {
       const params = new URLSearchParams();
-      params.set('full_log', '1');
-      params.set('log_max_chars', '2400000');
+      params.set('log_lines', '1200');
+      params.set('log_max_chars', '400000');
       return `/api/state?${params.toString()}`;
     }
 
-    async function refreshState() {
+    let refreshStateInFlight = false;
+    let refreshStateQueued = false;
+
+    async function refreshState(force = false) {
+      if (refreshStateInFlight && !force) {
+        refreshStateQueued = true;
+        return;
+      }
+      refreshStateInFlight = true;
       try {
         const res = await fetch(mainStateApiUrl(), { cache: 'no-store' });
         const data = await res.json();
@@ -19020,6 +19196,12 @@ TEMPLATE = """
         }
         setJobRunIndicator(false);
         renderSummaryAmpel();
+      } finally {
+        refreshStateInFlight = false;
+        if (refreshStateQueued) {
+          refreshStateQueued = false;
+          window.setTimeout(() => refreshState(true), 0);
+        }
       }
     }
 
@@ -19037,10 +19219,10 @@ TEMPLATE = """
       openUpdateProgressModal();
     }
     refreshState();
-    setInterval(refreshState, 3000);
+    setInterval(() => refreshState(), 3000);
     window.addEventListener('storage', (event) => {
       if (event && event.key === 'managemovie.ui.refresh') {
-        refreshState();
+        refreshState(true);
       }
       if (event && event.key === MM_UPDATE_MODAL_KEY) {
         if (updateModalStoredFlag(MM_UPDATE_MODAL_KEY) === '1') {

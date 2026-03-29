@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 from mmcore.db_cache import GeminiDbStore
 
-VERSION = "0.2.52"
+VERSION = "0.2.53"
 SCRIPT_NAME = f"managemovie_v{VERSION}.py"
 TMDB_ENABLED = (os.environ.get("MANAGEMOVIE_TMDB_ENABLED", "1") or "1").strip().lower() in {
     "1",
@@ -6212,18 +6212,49 @@ def estimate_copy_hard_timeout_seconds(source_size_bytes: int) -> float:
     return max(180.0, min(4.0 * 3600.0, estimated))
 
 
+def _mkdir_chain_ready(path: Path) -> None:
+    target = Path(path)
+    if target.exists():
+        if target.is_dir():
+            return
+        raise FileExistsError(errno.EEXIST, "Path exists and is not a directory", str(target))
+
+    anchor = Path(target.anchor) if target.is_absolute() else Path()
+    current = anchor
+    parts = target.parts
+    start_index = 1 if target.is_absolute() and parts else 0
+
+    for part in parts[start_index:]:
+        current = current / part if current != Path() else Path(part)
+        if current.exists():
+            if current.is_dir():
+                continue
+            raise FileExistsError(errno.EEXIST, "Path exists and is not a directory", str(current))
+        try:
+            current.mkdir(exist_ok=True)
+        except FileExistsError:
+            if current.exists() and current.is_dir():
+                continue
+            raise
+
+    if not target.exists() or not target.is_dir():
+        raise FileNotFoundError(errno.ENOENT, "Directory was not created", str(target))
+
+
 def ensure_parent_dir_ready(target_path: Path, *, retries: int = 8, delay_sec: float = 0.25) -> None:
     parent = Path(target_path).parent
     last_error: Exception | None = None
     for attempt in range(max(1, int(retries))):
         try:
-            parent.mkdir(parents=True, exist_ok=True)
+            _mkdir_chain_ready(parent)
             if parent.exists() and parent.is_dir():
                 return
         except FileExistsError as exc:
             last_error = exc
             if parent.exists() and parent.is_dir():
                 return
+        except FileNotFoundError as exc:
+            last_error = exc
         except OSError as exc:
             last_error = exc
             if exc.errno in {16, 17, 39} and parent.exists() and parent.is_dir():
@@ -6232,7 +6263,7 @@ def ensure_parent_dir_ready(target_path: Path, *, retries: int = 8, delay_sec: f
             time.sleep(max(0.05, float(delay_sec)))
     if last_error is not None:
         raise last_error
-    parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_chain_ready(parent)
 
 
 def copy_with_stall_guard(
