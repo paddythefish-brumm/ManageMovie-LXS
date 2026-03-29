@@ -4521,20 +4521,98 @@ def invalidate_worker_state_cache() -> None:
         worker_status_cache_payload = []
 
 
-def _run_worker_reinit(spec: dict[str, str]) -> None:
+def cluster_proxmox_nodes() -> list[str]:
+    nodes: list[str] = []
+    for candidate in ["pve01", *[str(spec.get("node", "") or "").strip() for spec in read_worker_specs()]]:
+        node = str(candidate or "").strip()
+        if node and node not in nodes:
+            nodes.append(node)
+    return nodes
+
+
+def detect_ct_node(ctid: str, nodes: list[str] | None = None, timeout: int = 8) -> str:
+    target_ctid = str(ctid or "").strip()
+    if not target_ctid:
+        return ""
+    for node in (nodes or cluster_proxmox_nodes()):
+        probe = run_proxmox_ssh(node, f"pct status {target_ctid} >/dev/null 2>&1", timeout=timeout)
+        if probe.returncode == 0:
+            return node
+    return ""
+
+
+def latest_ct240_backup_path() -> str:
+    latest = run_proxmox_ssh("pve01", "ls -1t /mnt/pve/nfs/dump/vzdump-lxc-240-*.tar.zst 2>/dev/null | head -n1", timeout=20)
+    return (latest.stdout or "").strip() if latest.returncode == 0 else ""
+
+
+def run_worker_kill_sync(spec: dict[str, str], *, log: Callable[[str], None] | None = None) -> tuple[bool, str]:
+    logger = log or (lambda _msg: None)
+    name = str(spec.get("name", "") or "").strip() or "worker"
+    write_worker_enabled_state(name, False)
+    requeued = requeue_dispatch_rows_for_worker(name)
+    try:
+        cleanup_remote_worker_runtime(spec)
+        logger(f"[worker:{name}] Kill: Encode abgebrochen und Worker bereinigt")
+    except Exception as err:
+        logger(f"[worker:{name}] Kill-Cleanup fehlgeschlagen: {err}")
+    try:
+        destroy_worker_container(spec)
+        logger(f"[worker:{name}] Kill: CT gelöscht")
+    except Exception as err:
+        logger(f"[worker:{name}] Kill fehlgeschlagen: {err}")
+        invalidate_worker_state_cache()
+        return False, f"{name} Kill fehlgeschlagen."
+    invalidate_worker_state_cache()
+    if requeued > 0:
+        logger(f"[worker:{name}] {requeued} Job(s) an Master-Queue zurückgegeben")
+    return True, f"{name} gelöscht. {requeued} Job(s) neu eingeplant."
+
+
+def create_master_backup_sync(*, log: Callable[[str], None] | None = None) -> tuple[bool, str, str]:
+    logger = log or (lambda _msg: None)
+    master_node = detect_ct_node("240") or "pve01"
+    logger(f"[update] Backup CT240 auf {master_node} gestartet")
+    backup = run_proxmox_ssh(
+        master_node,
+        "vzdump 240 --storage nfs --mode snapshot --compress zstd --stdout 0",
+        timeout=1800,
+    )
+    if backup.returncode != 0:
+        detail = (backup.stderr or backup.stdout or "").strip().splitlines()
+        reason = detail[-1] if detail else "unbekannt"
+        logger(f"[update] Backup CT240 fehlgeschlagen: {reason}")
+        return False, reason, ""
+    latest_path = latest_ct240_backup_path()
+    if not latest_path:
+        logger("[update] Neues CT240-Backup wurde nicht gefunden")
+        return False, "Backup wurde erstellt, aber nicht gefunden.", ""
+    logger(f"[update] Backup CT240 erstellt: {Path(latest_path).name}")
+    return True, "ok", latest_path
+
+
+def run_worker_reinit_sync(
+    spec: dict[str, str],
+    *,
+    latest_path: str = "",
+    log: Callable[[str], None] | None = None,
+) -> tuple[bool, str]:
+    logger = log or (lambda _msg: None)
     worker_name = str(spec.get("name", "") or "").strip() or "worker"
-    set_worker_reinit_running(worker_name, True)
     node = str(spec.get("node", "") or "").strip()
     ctid = str(spec.get("ctid", "") or "").strip()
     rootfs_size_gb = str(spec.get("rootfs_size_gb", "") or "").strip() or "6"
     swap_mb = str(spec.get("swap_mb", "") or "").strip() or "4096"
     hwaddr = worker_hwaddr(spec)
-    try:
-        if not node or not ctid:
-            append_processing_log(f"[worker:{worker_name}] Init nicht möglich: Node/CT-ID fehlt")
-            return
-        reset_processing_log()
-        append_processing_log(f"[worker:{worker_name}] Init gestartet")
+    if not node or not ctid:
+        logger(f"[worker:{worker_name}] Init nicht möglich: Node/CT-ID fehlt")
+        return False, "Node/CT-ID fehlt"
+    logger(f"[worker:{worker_name}] Init gestartet")
+
+    selected_backup = str(latest_path or "").strip()
+    if selected_backup:
+        logger(f"[worker:{worker_name}] Init nutzt Update-Backup: {Path(selected_backup).name}")
+    else:
         latest = run_proxmox_ssh(
             "pve01",
             "latest=$(ls -1t /mnt/pve/nfs/dump/vzdump-lxc-240-*.tar.zst 2>/dev/null | head -n1); "
@@ -4544,71 +4622,67 @@ def _run_worker_reinit(spec: dict[str, str]) -> None:
             timeout=20,
         )
         latest_payload = (latest.stdout or "").strip()
-        latest_path = ""
         if latest.returncode == 0 and latest_payload:
             latest_parts = latest_payload.split("\t", 1)
-            latest_path = latest_parts[0].strip()
+            selected_backup = latest_parts[0].strip()
             backup_age_sec = int(latest_parts[1].strip()) if len(latest_parts) > 1 and latest_parts[1].strip().isdigit() else 0
             backup_age_min = max(0, backup_age_sec // 60)
-            append_processing_log(
-                f"[worker:{worker_name}] Init nutzt vorhandenes Backup: {Path(latest_path).name} | Alter={backup_age_min} min"
-            )
+            logger(f"[worker:{worker_name}] Init nutzt vorhandenes Backup: {Path(selected_backup).name} | Alter={backup_age_min} min")
         else:
-            append_processing_log(f"[worker:{worker_name}] Kein frisches Backup gefunden, erstelle neues Backup")
-            backup = run_proxmox_ssh(
-                "pve01",
-                "vzdump 240 --storage nfs --mode snapshot --compress zstd --stdout 0",
-                timeout=1800,
-            )
-            if backup.returncode != 0:
-                detail = (backup.stderr or backup.stdout or "").strip().splitlines()
-                reason = detail[-1] if detail else "unbekannt"
-                append_processing_log(f"[worker:{worker_name}] Init-Backup fehlgeschlagen: {reason}")
-                return
-            latest = run_proxmox_ssh("pve01", "ls -1t /mnt/pve/nfs/dump/vzdump-lxc-240-*.tar.zst | head -n1")
-            latest_path = (latest.stdout or "").strip()
-            if latest.returncode != 0 or not latest_path:
-                append_processing_log(f"[worker:{worker_name}] Init-Backup nicht gefunden")
-                return
-        restore_cmd = (
-            f"pct shutdown {ctid} --forceStop 1 --timeout 20 >/dev/null 2>&1 || "
-            f"pct stop {ctid} --skiplock 1 >/dev/null 2>&1 || true; "
-            f"pct unlock {ctid} >/dev/null 2>&1 || true; "
-            f"pct destroy {ctid} --destroy-unreferenced-disks 1 >/dev/null 2>&1 || true; "
-            f"rm -rf /var/lib/lxc/{ctid} >/dev/null 2>&1 || true; "
-            f"pct restore {ctid} {shlex.quote(latest_path)} --rootfs local-zfs:{rootfs_size_gb}; "
-            f"pct set {ctid} -hostname {worker_name} -onboot 1 -swap {swap_mb} "
-            f"-net0 name=eth0,bridge=vmbr1,hwaddr={hwaddr},ip=dhcp,ip6=auto,mtu=9000,type=veth "
-            f"-dev0 /dev/dri/renderD128,gid=992 -dev1 /dev/dri/card0,gid=44; "
-            f"pct start {ctid}"
-        )
-        try:
-            restore = run_proxmox_ssh(node, restore_cmd, timeout=1800)
-        except subprocess.TimeoutExpired:
-            append_processing_log(f"[worker:{worker_name}] Init-Restore Timeout")
-            return
-        except Exception as err:
-            append_processing_log(f"[worker:{worker_name}] Init-Restore Ausnahme: {err}")
-            return
-        if restore.returncode != 0:
-            detail = (restore.stderr or restore.stdout or "").strip().splitlines()
-            reason = detail[-1] if detail else "unbekannt"
-            append_processing_log(f"[worker:{worker_name}] Init-Restore fehlgeschlagen: {reason}")
-            return
-        if not wait_for_ct_running(node, ctid, timeout=90):
-            append_processing_log(f"[worker:{worker_name}] Init-Start fehlgeschlagen")
-            return
-        profile_ok, profile_message = apply_worker_profile(spec)
-        if not profile_ok:
-            append_processing_log(f"[worker:{worker_name}] Init-Profil fehlgeschlagen: {profile_message}")
-            return
-        mount_ok, mount_message = ensure_worker_mount_ready(spec, timeout=90)
-        if not mount_ok:
-            append_processing_log(f"[worker:{worker_name}] Init-Mount fehlgeschlagen: {mount_message}")
-            return
-        write_worker_enabled_state(worker_name, True)
-        append_processing_log(f"[worker:{worker_name}] Init abgeschlossen")
-        invalidate_worker_state_cache()
+            logger(f"[worker:{worker_name}] Kein frisches Backup gefunden, erstelle neues Backup")
+            ok_backup, backup_message, selected_backup = create_master_backup_sync(log=logger)
+            if not ok_backup or not selected_backup:
+                logger(f"[worker:{worker_name}] Init-Backup fehlgeschlagen: {backup_message}")
+                return False, backup_message or "Init-Backup fehlgeschlagen"
+
+    restore_cmd = (
+        f"pct shutdown {ctid} --forceStop 1 --timeout 20 >/dev/null 2>&1 || "
+        f"pct stop {ctid} --skiplock 1 >/dev/null 2>&1 || true; "
+        f"pct unlock {ctid} >/dev/null 2>&1 || true; "
+        f"pct destroy {ctid} --destroy-unreferenced-disks 1 >/dev/null 2>&1 || true; "
+        f"rm -rf /var/lib/lxc/{ctid} >/dev/null 2>&1 || true; "
+        f"pct restore {ctid} {shlex.quote(selected_backup)} --rootfs local-zfs:{rootfs_size_gb}; "
+        f"pct set {ctid} -hostname {worker_name} -onboot 1 -swap {swap_mb} "
+        f"-net0 name=eth0,bridge=vmbr1,hwaddr={hwaddr},ip=dhcp,ip6=auto,mtu=9000,type=veth "
+        f"-dev0 /dev/dri/renderD128,gid=992 -dev1 /dev/dri/card0,gid=44; "
+        f"pct start {ctid}"
+    )
+    try:
+        restore = run_proxmox_ssh(node, restore_cmd, timeout=1800)
+    except subprocess.TimeoutExpired:
+        logger(f"[worker:{worker_name}] Init-Restore Timeout")
+        return False, "Init-Restore Timeout"
+    except Exception as err:
+        logger(f"[worker:{worker_name}] Init-Restore Ausnahme: {err}")
+        return False, str(err)
+    if restore.returncode != 0:
+        detail = (restore.stderr or restore.stdout or "").strip().splitlines()
+        reason = detail[-1] if detail else "unbekannt"
+        logger(f"[worker:{worker_name}] Init-Restore fehlgeschlagen: {reason}")
+        return False, reason
+    if not wait_for_ct_running(node, ctid, timeout=90):
+        logger(f"[worker:{worker_name}] Init-Start fehlgeschlagen")
+        return False, "Init-Start fehlgeschlagen"
+    profile_ok, profile_message = apply_worker_profile(spec)
+    if not profile_ok:
+        logger(f"[worker:{worker_name}] Init-Profil fehlgeschlagen: {profile_message}")
+        return False, profile_message
+    mount_ok, mount_message = ensure_worker_mount_ready(spec, timeout=90)
+    if not mount_ok:
+        logger(f"[worker:{worker_name}] Init-Mount fehlgeschlagen: {mount_message}")
+        return False, mount_message
+    write_worker_enabled_state(worker_name, True)
+    logger(f"[worker:{worker_name}] Init abgeschlossen")
+    invalidate_worker_state_cache()
+    return True, "ok"
+
+
+def _run_worker_reinit(spec: dict[str, str]) -> None:
+    worker_name = str(spec.get("name", "") or "").strip() or "worker"
+    set_worker_reinit_running(worker_name, True)
+    try:
+        reset_processing_log()
+        run_worker_reinit_sync(spec, log=append_processing_log)
     finally:
         set_worker_reinit_running(worker_name, False)
 
@@ -12370,18 +12444,40 @@ TEMPLATE = """
       --bg-soft: #d9e5fb;
       --ink: #101828;
       --panel: rgba(255, 255, 255, 0.84);
+      --panel-strong: #ffffff;
       --accent: #0a84ff;
       --accent-press: #0066d6;
       --line: rgba(70, 84, 104, 0.2);
+      --surface-strong: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(241, 246, 255, 0.96));
+      --surface-strong-border: rgba(136, 161, 208, 0.34);
+      --surface-strong-shadow: 0 14px 30px rgba(24, 39, 75, 0.12);
+      --surface-button: rgba(255, 255, 255, 0.9);
+      --surface-button-border: rgba(120, 144, 178, 0.28);
+      --surface-button-ink: #20344f;
+      --worker-ink: #12253f;
+      --worker-muted: #12253f;
+      --worker-gear-open: rgba(223, 235, 255, 0.98);
+      --worker-gear-open-border: rgba(93, 139, 233, 0.5);
     }
     html[data-theme="dark"] {
       --bg: #0b101a;
       --bg-soft: #1f2b41;
       --ink: #e6edf8;
       --panel: rgba(18, 24, 36, 0.9);
+      --panel-strong: #111827;
       --accent: #5fa8ff;
       --accent-press: #3f8deb;
       --line: rgba(136, 156, 186, 0.3);
+      --surface-strong: linear-gradient(180deg, rgba(28, 37, 55, 0.98), rgba(18, 25, 38, 0.98));
+      --surface-strong-border: rgba(91, 128, 196, 0.22);
+      --surface-strong-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      --surface-button: rgba(26, 36, 54, 0.96);
+      --surface-button-border: rgba(113, 156, 255, 0.28);
+      --surface-button-ink: #dce7ff;
+      --worker-ink: #c8d5e8;
+      --worker-muted: #c8d5e8;
+      --worker-gear-open: rgba(43, 67, 112, 0.95);
+      --worker-gear-open-border: rgba(113, 156, 255, 0.5);
     }
     body {
       margin: 0;
@@ -12804,9 +12900,9 @@ TEMPLATE = """
       margin-top: 0;
       min-width: 40px;
       padding: 6px 10px;
-      border-color: rgba(70, 84, 104, 0.28);
-      background: rgba(255, 255, 255, 0.86);
-      color: #20344f;
+      border-color: var(--surface-button-border);
+      background: var(--surface-button);
+      color: var(--surface-button-ink);
       font-weight: 800;
       font-size: 0.95rem;
       line-height: 1;
@@ -13771,12 +13867,11 @@ TEMPLATE = """
       }
     }
     .worker-tile {
-      border: 1px solid rgba(91, 128, 196, 0.22);
+      border: 1px solid var(--surface-strong-border);
       border-radius: 14px;
       padding: 12px 14px;
-      background:
-        linear-gradient(180deg, rgba(28, 37, 55, 0.98), rgba(18, 25, 38, 0.98));
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      background: var(--surface-strong);
+      box-shadow: var(--surface-strong-shadow);
     }
     .worker-head {
       display: flex;
@@ -13790,14 +13885,18 @@ TEMPLATE = """
       display: inline-flex;
       align-items: center;
       gap: 10px;
+      font-size: 0.9rem;
+      line-height: 1.2;
       min-width: 0;
       flex: 1 1 auto;
       white-space: nowrap;
     }
     .worker-name {
+      font-size: inherit;
       font-weight: 700;
-      letter-spacing: 0.02em;
-      color: #f4f7ff;
+      letter-spacing: 0;
+      line-height: inherit;
+      color: var(--worker-ink);
       white-space: nowrap;
     }
     .worker-dot {
@@ -13822,8 +13921,10 @@ TEMPLATE = """
       min-width: 0;
     }
     .worker-label {
-      font-size: 12px;
-      color: #d6e0f5;
+      font-size: inherit;
+      font-weight: 400;
+      color: var(--worker-muted);
+      line-height: inherit;
       min-width: 0;
       white-space: nowrap;
     }
@@ -13832,30 +13933,27 @@ TEMPLATE = """
       margin-left: auto;
       flex: 0 0 auto;
     }
-    .worker-menu[open] .worker-menu-btn {
-      background: rgba(43, 67, 112, 0.95);
-      border-color: rgba(113, 156, 255, 0.5);
+    .worker-menu-btn.active {
+      background: var(--worker-gear-open);
+      border-color: var(--worker-gear-open-border);
     }
     .worker-menu-btn {
-      list-style: none;
-      width: 42px;
-      height: 42px;
+      width: 44px;
+      min-width: 44px;
+      height: 44px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       border-radius: 12px;
-      border: 1px solid rgba(113, 156, 255, 0.28);
-      background: rgba(26, 36, 54, 0.96);
-      color: #dce7ff;
+      border: 1px solid var(--surface-button-border);
+      background: var(--surface-button);
+      color: var(--surface-button-ink);
       cursor: pointer;
       user-select: none;
       font-size: 23px;
       font-weight: 800;
       line-height: 1;
-      box-shadow: 0 8px 18px rgba(10, 18, 34, 0.24);
-    }
-    .worker-menu-btn::-webkit-details-marker {
-      display: none;
+      box-shadow: 0 8px 18px rgba(10, 18, 34, 0.12);
     }
     .worker-menu-content {
       margin-top: 12px;
@@ -13866,9 +13964,6 @@ TEMPLATE = """
       gap: 12px;
       flex: 0 0 100%;
       width: 100%;
-    }
-    .worker-menu:not([open]) + .worker-menu-content {
-      display: none;
     }
     .worker-actions {
       display: flex;
@@ -13885,8 +13980,9 @@ TEMPLATE = """
       border-radius: 10px;
       border: 1px solid transparent;
       cursor: pointer;
-      font-size: 12px;
+      font-size: 0.9rem;
       font-weight: 700;
+      line-height: 1.2;
       color: #f8fbff;
       min-width: 0;
       flex: 1 1 0;
@@ -13921,17 +14017,20 @@ TEMPLATE = """
     }
     .worker-name-note {
       margin-left: 8px;
-      font-size: 0.82rem;
-      font-weight: 700;
-      color: #8fa0c2;
+      font-size: inherit;
+      font-weight: 400;
+      line-height: inherit;
+      color: var(--worker-muted);
     }
     .worker-meta {
       display: flex;
       align-items: center;
       flex: 0 0 auto;
       min-height: 0;
-      font-size: 11px;
-      color: #8fa0c2;
+      font-size: 0.9rem;
+      font-weight: 400;
+      line-height: 1.2;
+      color: var(--worker-muted);
       margin: 0;
       white-space: nowrap;
     }
@@ -13985,10 +14084,10 @@ TEMPLATE = """
                   <span class="worker-label" data-worker-label="{{ worker_name }}">N/A</span>
                 </div>
               </div>
-              <details class="worker-menu">
-                <summary class="worker-menu-btn" title="Worker-Aktionen" aria-label="Worker-Aktionen">&#9881;</summary>
-              </details>
-              <div class="worker-menu-content">
+              <div class="worker-menu">
+                <button type="button" class="log-expand-btn worker-menu-btn" data-worker-toggle="{{ worker_name }}" title="Aufklappen" aria-label="Aufklappen" onclick="toggleWorkerMenu('{{ worker_name }}', this)">↗</button>
+              </div>
+              <div class="worker-menu-content hidden" data-worker-menu-content="{{ worker_name }}">
                 <div class="worker-meta" data-worker-meta="{{ worker_name }}"></div>
                 <div class="worker-actions">
                   <button type="button" class="worker-action-kill" data-worker-name="{{ worker_name }}" data-worker-action="kill" onclick="controlWorker('{{ worker_name }}','kill')">Kill</button>
@@ -14545,7 +14644,7 @@ TEMPLATE = """
               if (speedText) infoParts.push(speedText);
               if (fpsText) infoParts.push(`${fpsText} FPS`);
               const infoText = infoParts.length ? ` | ${infoParts.join(' | ')}` : '';
-              lines.push(`<span>${escHtmlUi(fileText || '-')}<span style="color:#8fa0c2">${escHtmlUi(infoText)}</span></span>`);
+              lines.push(`<span>${escHtmlUi(fileText || '-')}<span style="color:var(--worker-muted)">${escHtmlUi(infoText)}</span></span>`);
             });
             if (!runningWorkerJobs.length && worker.active_job) {
               const speedText = formatStatusSpeedText(worker.active_speed || '');
@@ -14554,7 +14653,7 @@ TEMPLATE = """
               if (speedText) infoParts.push(speedText);
               if (fpsText) infoParts.push(`${fpsText} FPS`);
               const infoText = infoParts.length ? ` | ${infoParts.join(' | ')}` : '';
-              lines.push(`<span>${escHtmlUi(fileNameOnlyForUi(worker.active_job))}<span style="color:#8fa0c2">${escHtmlUi(infoText)}</span></span>`);
+              lines.push(`<span>${escHtmlUi(fileNameOnlyForUi(worker.active_job))}<span style="color:var(--worker-muted)">${escHtmlUi(infoText)}</span></span>`);
             }
           }
           meta.innerHTML = lines.join('<br>');
@@ -16287,6 +16386,18 @@ TEMPLATE = """
       const next = !!collapsed;
       card.classList.toggle('collapsed', next);
       card.querySelectorAll('.collapse-toggle-btn').forEach((btn) => updateCollapseButton(btn, next));
+    }
+
+    function toggleWorkerMenu(workerName, triggerBtn) {
+      const name = String(workerName || '').trim();
+      if (!name) return;
+      const body = document.querySelector(`[data-worker-menu-content="${name}"]`);
+      const btn = triggerBtn || document.querySelector(`[data-worker-toggle="${name}"]`);
+      if (!body || !btn) return;
+      const open = body.classList.contains('hidden');
+      body.classList.toggle('hidden', !open);
+      updateCollapseButton(btn, !open);
+      btn.classList.toggle('active', open);
     }
 
     function collapseToHomeLayout() {
