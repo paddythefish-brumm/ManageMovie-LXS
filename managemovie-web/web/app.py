@@ -185,6 +185,7 @@ DEFAULT_WORKER_SPECS = (
 )
 WORKER_STATUS_CACHE_TTL_SEC = 10.0
 DEFAULT_WORKER_NAS_EXPORT = "192.168.100.201:/mnt/pool2_5x8tb/media3"
+UPDATE_UNIT_NAME = "managemovie-self-update"
 
 
 def nocache_html_response(html: str):
@@ -4591,6 +4592,29 @@ def create_master_backup_sync(*, log: Callable[[str], None] | None = None) -> tu
     return True, "ok", latest_path
 
 
+def parse_restore_metrics(raw_output: str) -> tuple[str, str] | None:
+    text = str(raw_output or "")
+    if not text:
+        return None
+    matches = list(
+        re.finditer(
+            r"Total bytes read:\s*\d+\s*\(([0-9]+(?:[.,][0-9]+)?)\s*([KMGT]iB),\s*([0-9]+(?:[.,][0-9]+)?)\s*([KMGT]iB/s)\)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not matches:
+        return None
+    match = matches[-1]
+    size_value = str(match.group(1) or "").strip().replace(",", ".")
+    size_unit = str(match.group(2) or "").strip()
+    speed_value = str(match.group(3) or "").strip().replace(",", ".")
+    speed_unit = str(match.group(4) or "").strip()
+    if not size_value or not size_unit or not speed_value or not speed_unit:
+        return None
+    return f"{size_value} {size_unit}", f"{speed_value} {speed_unit}"
+
+
 def run_worker_reinit_sync(
     spec: dict[str, str],
     *,
@@ -4660,6 +4684,10 @@ def run_worker_reinit_sync(
         reason = detail[-1] if detail else "unbekannt"
         logger(f"[worker:{worker_name}] Init-Restore fehlgeschlagen: {reason}")
         return False, reason
+    restore_metrics = parse_restore_metrics("\n".join(filter(None, [restore.stdout or "", restore.stderr or ""])))
+    if restore_metrics:
+        restore_size, restore_speed = restore_metrics
+        logger(f"[update] {worker_name} Restore: {restore_size} @ {restore_speed}")
     if not wait_for_ct_running(node, ctid, timeout=90):
         logger(f"[worker:{worker_name}] Init-Start fehlgeschlagen")
         return False, "Init-Start fehlgeschlagen"
@@ -6315,6 +6343,62 @@ exit 0
     return True, "Update wird ausgefuehrt."
 
 
+def append_update_progress_line(message: str, *, debug: bool = False) -> None:
+    text = str(message or "").strip()
+    if not text:
+        return
+    target = LOG_DIR / ("system-update-debug.log" if debug else "system-update.log")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+    except Exception:
+        pass
+
+
+def abort_system_update() -> tuple[bool, str]:
+    global update_requested_at
+    update_log = LOG_DIR / "system-update.log"
+    update_debug_log = LOG_DIR / "system-update-debug.log"
+    running = False
+    try:
+        current_log = tail_file(update_log, lines=80, max_chars=16000)
+        markers = re.findall(r"\[update-status\]\s+(running|done(?:\s+rc=(\d+))?)", current_log, flags=re.IGNORECASE)
+        if markers:
+            running = not markers[-1][0].strip().lower().startswith("done")
+        elif update_log.exists():
+            running = (time.time() - float(update_log.stat().st_mtime)) < 900
+    except Exception:
+        running = False
+    if not running:
+        update_requested_at = 0.0
+        return False, "Es läuft aktuell kein Update."
+
+    append_update_progress_line("[update] Abbruch angefordert")
+    append_update_progress_line("[update] Abbruch angefordert", debug=True)
+
+    commands = [
+        f"systemctl stop {UPDATE_UNIT_NAME} >/dev/null 2>&1 || true",
+        "pkill -TERM -f 'system-update-launcher.sh' >/dev/null 2>&1 || true",
+        "pkill -TERM -f '[u]pdate_ManageMovie.sh' >/dev/null 2>&1 || true",
+        "pkill -TERM -f 'python - /opt/managemovie/managemovie-web/web/app.py pre' >/dev/null 2>&1 || true",
+        "pkill -TERM -f 'python - /opt/managemovie/managemovie-web/web/app.py post' >/dev/null 2>&1 || true",
+        "sleep 2",
+        "pkill -KILL -f 'system-update-launcher.sh' >/dev/null 2>&1 || true",
+        "pkill -KILL -f '[u]pdate_ManageMovie.sh' >/dev/null 2>&1 || true",
+        "pkill -KILL -f 'python - /opt/managemovie/managemovie-web/web/app.py pre' >/dev/null 2>&1 || true",
+        "pkill -KILL -f 'python - /opt/managemovie/managemovie-web/web/app.py post' >/dev/null 2>&1 || true",
+    ]
+    subprocess.run(["bash", "-lc", " ; ".join(commands)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    append_update_progress_line("[update] Update wurde abgebrochen")
+    append_update_progress_line("[update-status] done rc=130")
+    append_update_progress_line("[update] Update wurde abgebrochen", debug=True)
+    append_update_progress_line("[update-status] done rc=130", debug=True)
+    update_requested_at = 0.0
+    return True, "Update wird abgebrochen."
+
+
 @app.route("/")
 def index():
     ensure_layout()
@@ -6441,13 +6525,26 @@ def api_system_update():
     return jsonify({"ok": True, "message": msg})
 
 
+@app.route("/api/system/update-stop", methods=["POST"])
+def api_system_update_stop():
+    ok, msg = abort_system_update()
+    if not ok:
+        return jsonify({"ok": False, "error": msg}), 409
+    return jsonify({"ok": True, "message": msg})
+
+
 @app.route("/api/system/update-status")
 def api_system_update_status():
     update_log = LOG_DIR / "system-update.log"
+    update_debug_log = LOG_DIR / "system-update-debug.log"
     log_text = tail_file(update_log, lines=360, max_chars=120000)
+    debug_log_text = tail_file(update_debug_log, lines=360, max_chars=120000)
     log_exists = update_log.exists()
+    debug_log_exists = update_debug_log.exists()
     log_size = 0
+    debug_log_size = 0
     log_mtime = 0.0
+    debug_log_mtime = 0.0
     if log_exists:
         try:
             stat = update_log.stat()
@@ -6456,6 +6553,14 @@ def api_system_update_status():
         except Exception:
             log_size = 0
             log_mtime = 0.0
+    if debug_log_exists:
+        try:
+            stat = update_debug_log.stat()
+            debug_log_size = int(stat.st_size)
+            debug_log_mtime = float(stat.st_mtime)
+        except Exception:
+            debug_log_size = 0
+            debug_log_mtime = 0.0
 
     running = False
     done = False
@@ -6484,6 +6589,7 @@ def api_system_update_status():
         {
             "ok": True,
             "running": running,
+            "can_abort": running,
             "done": done,
             "success": success,
             "return_code": return_code,
@@ -6491,6 +6597,10 @@ def api_system_update_status():
             "log_size": log_size,
             "log_mtime": log_mtime,
             "log": log_text,
+            "debug_log_exists": debug_log_exists,
+            "debug_log_size": debug_log_size,
+            "debug_log_mtime": debug_log_mtime,
+            "debug_log": debug_log_text,
         }
     )
 
@@ -13168,6 +13278,25 @@ TEMPLATE = """
       word-break: break-word;
       font-family: "SF Mono", "SFMono-Regular", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     }
+    .update-progress-log-label {
+      font-size: 0.88rem;
+      line-height: 1.3;
+      font-weight: 700;
+      color: #17325c;
+      margin: 2px 0 -2px 0;
+    }
+    .update-progress-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 2px;
+    }
+    .update-progress-actions .btn,
+    .update-progress-actions button {
+      width: auto;
+      min-width: 140px;
+      margin-top: 0;
+    }
     .confirm-modal-actions {
       display: flex;
       justify-content: flex-end;
@@ -13363,7 +13492,8 @@ TEMPLATE = """
       -webkit-text-fill-color: #f2f7ff;
     }
     html[data-theme="dark"] .update-progress-status,
-    html[data-theme="dark"] .confirm-modal-text {
+    html[data-theme="dark"] .confirm-modal-text,
+    html[data-theme="dark"] .update-progress-log-label {
       color: #eef4ff;
     }
     html[data-theme="dark"] .update-progress-pre {
@@ -14388,7 +14518,13 @@ TEMPLATE = """
       </div>
       <div class="update-progress-body">
         <div id="updateProgressStatus" class="update-progress-status">Noch kein Update gestartet.</div>
+        <div class="update-progress-log-label">Ablauf</div>
         <pre id="updateProgressPre" class="update-progress-pre">(leer)</pre>
+        <div class="update-progress-log-label">Technisches Log</div>
+        <pre id="updateProgressDebugPre" class="update-progress-pre">(leer)</pre>
+        <div class="update-progress-actions">
+          <button id="updateAbortBtn" type="button" class="btn btn-stop" onclick="requestUpdateAbort()">Abbrechen</button>
+        </div>
       </div>
     </div>
   </div>
@@ -14561,6 +14697,7 @@ TEMPLATE = """
     let stopRequestInFlight = false;
     let updateRequestInFlight = false;
     let updateStatusInFlight = false;
+    let updateAbortInFlight = false;
     let updateStatusPollHandle = null;
     let lastKnownJobFolder = '';
     let bypassStartConfirmOnce = false;
@@ -15079,6 +15216,23 @@ TEMPLATE = """
       }
     }
 
+    function setUpdateProgressDebugLog(text = '') {
+      const el = document.getElementById('updateProgressDebugPre');
+      if (!el) return;
+      const next = String(text || '').trim();
+      const nearBottom = (el.scrollTop + el.clientHeight + 40) >= el.scrollHeight;
+      el.innerText = next || '(leer)';
+      if (nearBottom) {
+        el.scrollTop = el.scrollHeight;
+      }
+    }
+
+    function setUpdateAbortButtonState(running, done, canAbort = false) {
+      const btn = document.getElementById('updateAbortBtn');
+      if (!btn) return;
+      btn.disabled = !!updateAbortInFlight || !running || !canAbort || !!done;
+    }
+
     function stopUpdateStatusPolling() {
       if (updateStatusPollHandle) {
         clearInterval(updateStatusPollHandle);
@@ -15093,11 +15247,15 @@ TEMPLATE = """
         const res = await fetch('/api/system/update-status', { cache: 'no-store' });
         const data = await res.json().catch(() => ({}));
         const running = !!(data && data.running);
+        const canAbort = !!(data && data.can_abort);
         const done = !!(data && data.done);
         const success = !!(data && data.success);
         const returnCode = (data && typeof data.return_code !== 'undefined') ? data.return_code : null;
         const logText = (data && data.log) ? String(data.log) : '';
+        const debugLogText = (data && data.debug_log) ? String(data.debug_log) : '';
         setUpdateProgressLog(logText);
+        setUpdateProgressDebugLog(debugLogText);
+        setUpdateAbortButtonState(running, done, canAbort);
         if (running) {
           setUpdateProgressStatus('Update läuft. Der Verlauf wird live aktualisiert.');
         } else if (done && success) {
@@ -15116,6 +15274,7 @@ TEMPLATE = """
           setUpdateProgressStatus('Warte auf Update-Status...');
         }
       } catch (err) {
+        setUpdateAbortButtonState(false, false, false);
         setUpdateProgressStatus('Verbindung getrennt. Warte auf Neustart der App...');
       } finally {
         updateStatusInFlight = false;
@@ -15155,6 +15314,8 @@ TEMPLATE = """
       openUpdateProgressModal();
       setUpdateProgressStatus('Update wird gestartet...');
       setUpdateProgressLog('');
+      setUpdateProgressDebugLog('');
+      setUpdateAbortButtonState(false, false, false);
       updateModalStoredFlag(MM_UPDATE_RELOADED_KEY, '');
       updateRequestInFlight = true;
       try {
@@ -15171,6 +15332,38 @@ TEMPLATE = """
         setUpdateProgressStatus('Verbindung getrennt. Warte auf Neustart der App...');
       } finally {
         updateRequestInFlight = false;
+      }
+    }
+
+    async function requestUpdateAbort() {
+      if (updateAbortInFlight) return;
+      const ok = await askBrowserConfirm(
+        'Update wirklich abbrechen? Bereits laufende Restore- oder Backup-Schritte werden nur best effort gestoppt.',
+        'Update abbrechen',
+        {
+          cancelLabel: 'Zurück',
+          okLabel: 'Abbrechen',
+          okClass: 'btn-stop',
+        },
+      );
+      if (!ok) return;
+      updateAbortInFlight = true;
+      setUpdateAbortButtonState(true, false, true);
+      setUpdateProgressStatus('Update wird abgebrochen...');
+      try {
+        const res = await fetch('/api/system/update-stop', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data && data.ok) {
+          setUpdateProgressStatus('Update-Abbruch ausgelöst. Warte auf Abschluss...');
+          await refreshUpdateProgressStatus(true);
+          return;
+        }
+        const err = (data && data.error) ? String(data.error) : 'Update-Abbruch fehlgeschlagen.';
+        setUpdateProgressStatus(err);
+      } catch (err) {
+        setUpdateProgressStatus('Update-Abbruch fehlgeschlagen.');
+      } finally {
+        updateAbortInFlight = false;
       }
     }
 
@@ -15225,7 +15418,18 @@ TEMPLATE = """
       );
     }
 
-    function openUpdateWindow() {
+    async function openUpdateWindow() {
+      try {
+        const res = await fetch('/api/system/update-status', { cache: 'no-store' });
+        const data = await res.json().catch(() => ({}));
+        const running = !!(data && data.running);
+        if (running) {
+          openUpdateProgressModal();
+          await refreshUpdateProgressStatus(true);
+          return;
+        }
+      } catch (err) {
+      }
       askBrowserConfirm(
         'Neuestes Release von GitHub holen und die App danach sauber neu starten?',
         'Update bestätigen',
