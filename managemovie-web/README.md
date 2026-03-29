@@ -1,4 +1,4 @@
-# ManageMovie Web (0.2.47)
+# ManageMovie Web (0.2.48)
 
 Dieser Unterbau enthält die Web-App und den Runner für den LXC-Betrieb.
 

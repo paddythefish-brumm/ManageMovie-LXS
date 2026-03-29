@@ -4687,6 +4687,59 @@ def _run_worker_reinit(spec: dict[str, str]) -> None:
         set_worker_reinit_running(worker_name, False)
 
 
+def run_system_update_preflight(*, log: Callable[[str], None] | None = None) -> tuple[bool, str]:
+    logger = log or (lambda _msg: None)
+    specs = read_worker_specs()
+    if not specs:
+        logger("[update] Keine Worker vorhanden")
+        return True, "Keine Worker konfiguriert."
+    logger(f"[update] {len(specs)} Worker werden entfernt")
+    failures: list[str] = []
+    for spec in specs:
+        name = str(spec.get("name", "") or "").strip() or "worker"
+        logger(f"[update] {name} wird entfernt")
+        ok, msg = run_worker_kill_sync(spec)
+        if ok:
+            logger(f"[update] {name} entfernt")
+        else:
+            logger(f"[update] {name} konnte nicht entfernt werden: {msg}")
+            failures.append(f"{name}: {msg}")
+    invalidate_worker_state_cache()
+    if failures:
+        return False, " | ".join(failures)
+    logger("[update] Alle Worker sind entfernt")
+    return True, "Alle Worker gelöscht."
+
+
+def run_system_update_postflight(*, log: Callable[[str], None] | None = None) -> tuple[bool, str]:
+    logger = log or (lambda _msg: None)
+    logger("[update] Ein neues Backup von CT240 wird erstellt")
+    ok_backup, backup_message, backup_path = create_master_backup_sync()
+    if not ok_backup or not backup_path:
+        return False, backup_message or "Backup fehlgeschlagen."
+    logger(f"[update] Backup erstellt: {Path(backup_path).name}")
+    specs = read_worker_specs()
+    if not specs:
+        logger("[update] Keine Worker vorhanden")
+        return True, f"Backup erstellt: {Path(backup_path).name}"
+    logger(f"[update] {len(specs)} Worker werden neu aufgebaut")
+    failures: list[str] = []
+    for spec in specs:
+        name = str(spec.get("name", "") or "").strip() or "worker"
+        logger(f"[update] {name} wird neu aufgebaut")
+        ok, msg = run_worker_reinit_sync(spec, latest_path=backup_path)
+        if ok:
+            logger(f"[update] {name} ist wieder bereit")
+        else:
+            logger(f"[update] {name} konnte nicht neu aufgebaut werden: {msg}")
+            failures.append(f"{name}: {msg}")
+    invalidate_worker_state_cache()
+    if failures:
+        return False, " | ".join(failures)
+    logger("[update] Alle Worker sind wieder bereit")
+    return True, f"Backup erstellt und {len(specs)} Worker neu initialisiert."
+
+
 def run_worker_action(worker_name: str, action: str) -> tuple[bool, str]:
     name = str(worker_name or "").strip()
     verb = str(action or "").strip().lower()
@@ -4707,24 +4760,7 @@ def run_worker_action(worker_name: str, action: str) -> tuple[bool, str]:
         return True, f"{name} Init gestartet."
 
     if verb == "kill":
-        write_worker_enabled_state(name, False)
-        requeued = requeue_dispatch_rows_for_worker(name)
-        try:
-            cleanup_remote_worker_runtime(spec)
-            append_processing_log(f"[worker:{name}] Kill: Encode abgebrochen und Worker bereinigt")
-        except Exception as err:
-            append_processing_log(f"[worker:{name}] Kill-Cleanup fehlgeschlagen: {err}")
-        try:
-            destroy_worker_container(spec)
-            append_processing_log(f"[worker:{name}] Kill: CT gelöscht")
-        except Exception as err:
-            append_processing_log(f"[worker:{name}] Kill fehlgeschlagen: {err}")
-            invalidate_worker_state_cache()
-            return False, f"{name} Kill fehlgeschlagen."
-        invalidate_worker_state_cache()
-        if requeued > 0:
-            append_processing_log(f"[worker:{name}] {requeued} Job(s) an Master-Queue zurückgegeben")
-        return True, f"{name} gelöscht. {requeued} Job(s) neu eingeplant."
+        return run_worker_kill_sync(spec, log=append_processing_log)
 
     if verb == "pause":
         write_worker_enabled_state(name, False)
@@ -6150,31 +6186,104 @@ def schedule_system_update() -> tuple[bool, str]:
     project_root = BASE_DIR.parent
     update_script = project_root / "update_ManageMovie.sh"
     update_log = LOG_DIR / "system-update.log"
+    update_debug_log = LOG_DIR / "system-update-debug.log"
     update_log.parent.mkdir(parents=True, exist_ok=True)
 
+    python_bin = (sys.executable or shutil.which("python3") or "python3").strip() or "python3"
+    app_script = Path(__file__).resolve()
     q_project_root = shlex.quote(str(project_root))
     q_update = shlex.quote(str(update_script))
     q_log = shlex.quote(str(update_log))
+    q_debug_log = shlex.quote(str(update_debug_log))
+    q_python = shlex.quote(str(python_bin))
+    q_app = shlex.quote(str(app_script))
 
     shell_script = f"""#!/usr/bin/env bash
 set +e
 sleep 1
 cd {q_project_root}
 : > {q_log}
-echo "[`date '+%Y-%m-%d %H:%M:%S'`] update requested" >> {q_log}
-echo "[update-status] running" >> {q_log}
+: > {q_debug_log}
+log_line() {{
+  printf '%s\\n' "$1" >> {q_log}
+}}
+run_update_phase() {{
+  local phase="$1"
+  {q_python} - {q_app} "$phase" >> {q_log} 2>&1 <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+app_path = pathlib.Path(sys.argv[1])
+phase = sys.argv[2]
+spec = importlib.util.spec_from_file_location("managemovie_update_app", str(app_path))
+if spec is None or spec.loader is None:
+    print("[update] Die Update-Helfer konnten nicht geladen werden.", flush=True)
+    raise SystemExit(1)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def log(message: str) -> None:
+    print(str(message), flush=True)
+
+if phase == "pre":
+    ok, msg = module.run_system_update_preflight(log=log)
+elif phase == "post":
+    ok, msg = module.run_system_update_postflight(log=log)
+else:
+    print(f"[update] Unbekannte Update-Phase: {{phase}}", flush=True)
+    raise SystemExit(2)
+
+print(f"[update] {{msg}}", flush=True)
+raise SystemExit(0 if ok else 1)
+PY
+}}
+log_line "[`date '+%Y-%m-%d %H:%M:%S'`] Update gestartet"
+log_line "[update-status] running"
 if [ -f {q_update} ] && [ ! -x {q_update} ]; then
-  chmod +x {q_update} >> {q_log} 2>&1 || true
+  chmod +x {q_update} >> {q_debug_log} 2>&1 || true
 fi
 if [ ! -x {q_update} ]; then
-  echo "[update] update_ManageMovie.sh fehlt oder ist nicht ausführbar: {q_update}" >> {q_log}
-  echo "[update-status] done rc=1" >> {q_log}
+  log_line "[update] Die Update-Datei fehlt oder ist nicht ausführbar."
+  log_line "[update-status] done rc=1"
   exit 1
 fi
-{q_update} >> {q_log} 2>&1
+log_line "[update] Vorbereitungen laufen"
+run_update_phase pre
 rc=$?
-echo "[update-status] done rc=$rc" >> {q_log}
-exit $rc
+if [ "$rc" -ne 0 ]; then
+  log_line "[update] Das Update wurde vor dem Einspielen abgebrochen."
+  log_line "[update-status] done rc=$rc"
+  exit $rc
+fi
+log_line "[update] Das neue Release wird eingespielt"
+{q_update} >> {q_debug_log} 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  log_line "[update] Das Release konnte nicht installiert werden."
+  if [ -s {q_debug_log} ]; then
+    log_line "[update] Technischer Auszug:"
+    tail -n 40 {q_debug_log} >> {q_log} 2>&1 || true
+  fi
+  log_line "[update-status] done rc=$rc"
+  exit $rc
+fi
+log_line "[update] Das Release ist installiert"
+log_line "[update] Backup und Worker-Neustart laufen"
+run_update_phase post
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  log_line "[update] Das Release ist installiert, aber der LXS-Nachlauf ist fehlgeschlagen."
+  if [ -s {q_debug_log} ]; then
+    log_line "[update] Technischer Auszug:"
+    tail -n 40 {q_debug_log} >> {q_log} 2>&1 || true
+  fi
+  log_line "[update-status] done rc=$rc"
+  exit $rc
+fi
+log_line "[update] Das Update ist vollständig abgeschlossen"
+log_line "[update-status] done rc=0"
+exit 0
 """
 
     launcher_path = LOG_DIR / "system-update-launcher.sh"
@@ -6335,7 +6444,7 @@ def api_system_update():
 @app.route("/api/system/update-status")
 def api_system_update_status():
     update_log = LOG_DIR / "system-update.log"
-    log_text = tail_file(update_log, lines=220, max_chars=64000)
+    log_text = tail_file(update_log, lines=360, max_chars=120000)
     log_exists = update_log.exists()
     log_size = 0
     log_mtime = 0.0
