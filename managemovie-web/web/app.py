@@ -4932,10 +4932,12 @@ def run_worker_reinit_sync(
         logger(f"[worker:{worker_name}] Init nicht möglich: Node/CT-ID fehlt")
         return False, "Node/CT-ID fehlt"
     logger(f"[worker:{worker_name}] Init gestartet")
+    logger(f"[update] {worker_name}: Ziel {node} CT{ctid} | rootfs local-zfs:{rootfs_size_gb}")
 
     selected_backup = str(latest_path or "").strip()
     if selected_backup:
         logger(f"[worker:{worker_name}] Init nutzt Update-Backup: {Path(selected_backup).name}")
+        logger(f"[update] {worker_name}: Nutzt Backup {Path(selected_backup).name}")
     else:
         latest = run_proxmox_ssh(
             "pve01",
@@ -4952,13 +4954,16 @@ def run_worker_reinit_sync(
             backup_age_sec = int(latest_parts[1].strip()) if len(latest_parts) > 1 and latest_parts[1].strip().isdigit() else 0
             backup_age_min = max(0, backup_age_sec // 60)
             logger(f"[worker:{worker_name}] Init nutzt vorhandenes Backup: {Path(selected_backup).name} | Alter={backup_age_min} min")
+            logger(f"[update] {worker_name}: Nutzt Backup {Path(selected_backup).name} ({backup_age_min} min alt)")
         else:
             logger(f"[worker:{worker_name}] Kein frisches Backup gefunden, erstelle neues Backup")
+            logger(f"[update] {worker_name}: Kein frisches Backup gefunden, erstelle neues Backup")
             ok_backup, backup_message, selected_backup = create_master_backup_sync(log=logger)
             if not ok_backup or not selected_backup:
                 logger(f"[worker:{worker_name}] Init-Backup fehlgeschlagen: {backup_message}")
                 return False, backup_message or "Init-Backup fehlgeschlagen"
 
+    logger(f"[update] {worker_name}: Restore startet auf {node}")
     restore_cmd = (
         f"pct shutdown {ctid} --forceStop 1 --timeout 20 >/dev/null 2>&1 || "
         f"pct stop {ctid} --skiplock 1 >/dev/null 2>&1 || true; "
@@ -4984,17 +4989,21 @@ def run_worker_reinit_sync(
         reason = detail[-1] if detail else "unbekannt"
         logger(f"[worker:{worker_name}] Init-Restore fehlgeschlagen: {reason}")
         return False, reason
+    logger(f"[update] {worker_name}: Restore abgeschlossen")
     restore_metrics = parse_restore_metrics("\n".join(filter(None, [restore.stdout or "", restore.stderr or ""])))
     if restore_metrics:
         restore_size, restore_speed = restore_metrics
         logger(f"[update] {worker_name} Restore: {restore_size} @ {restore_speed}")
+    logger(f"[update] {worker_name}: CT wird gestartet")
     if not wait_for_ct_running(node, ctid, timeout=90):
         logger(f"[worker:{worker_name}] Init-Start fehlgeschlagen")
         return False, "Init-Start fehlgeschlagen"
+    logger(f"[update] {worker_name}: Profil wird angewendet")
     profile_ok, profile_message = apply_worker_profile(spec)
     if not profile_ok:
         logger(f"[worker:{worker_name}] Init-Profil fehlgeschlagen: {profile_message}")
         return False, profile_message
+    logger(f"[update] {worker_name}: Mount wird geprüft")
     mount_ok, mount_message = ensure_worker_mount_ready(spec, timeout=90)
     if not mount_ok:
         logger(f"[worker:{worker_name}] Init-Mount fehlgeschlagen: {mount_message}")
@@ -5054,7 +5063,10 @@ def run_system_update_postflight(*, log: Callable[[str], None] | None = None) ->
     failures: list[str] = []
     for spec in specs:
         name = str(spec.get("name", "") or "").strip() or "worker"
+        node = str(spec.get("node", "") or "").strip()
+        ctid = str(spec.get("ctid", "") or "").strip()
         logger(f"[update] {name} wird neu aufgebaut")
+        logger(f"[update] {name}: {node} CT{ctid}")
         ok, msg = run_worker_reinit_sync(spec, latest_path=backup_path)
         if ok:
             logger(f"[update] {name} ist wieder bereit")

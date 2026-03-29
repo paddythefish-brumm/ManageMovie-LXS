@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 from mmcore.db_cache import GeminiDbStore
 
-VERSION = "0.2.53"
+VERSION = "0.2.54"
 SCRIPT_NAME = f"managemovie_v{VERSION}.py"
 TMDB_ENABLED = (os.environ.get("MANAGEMOVIE_TMDB_ENABLED", "1") or "1").strip().lower() in {
     "1",
