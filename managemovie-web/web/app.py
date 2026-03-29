@@ -6277,12 +6277,39 @@ cd {q_project_root}
 : > {q_debug_log}
 current_version={q_current_version}
 target_version={q_target_version}
-log_line() {{
+status_line() {{
   printf '%s\\n' "$1" >> {q_log}
+}}
+display_line() {{
+  local message="$1"
+  local ts
+  ts="$(date '+%H:%M:%S')"
+  printf '[%s] %s\\n' "$ts" "$message" >> {q_log}
+}}
+route_phase_output() {{
+  local line="$1"
+  {q_python} - <<'PY' "$line" {q_log}
+import importlib.util
+import pathlib
+import sys
+
+raw = str(sys.argv[1] or "")
+log_path = pathlib.Path(sys.argv[2])
+app_path = pathlib.Path({q_app})
+spec = importlib.util.spec_from_file_location("managemovie_update_app", str(app_path))
+if spec is None or spec.loader is None:
+    raise SystemExit(0)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with log_path.open("a", encoding="utf-8") as handle:
+    module.route_update_display_line(handle, raw)
+PY
 }}
 run_update_phase() {{
   local phase="$1"
-  MANAGEMOVIE_SKIP_DB_INIT=1 {q_python} - {q_app} "$phase" >> {q_log} 2>&1 <<'PY'
+  local phase_log
+  phase_log="$(mktemp)"
+  MANAGEMOVIE_SKIP_DB_INIT=1 PYTHONWARNINGS=ignore::SyntaxWarning {q_python} - {q_app} "$phase" > "$phase_log" 2>&1 <<'PY'
 import importlib.util
 import pathlib
 import sys
@@ -6310,47 +6337,53 @@ else:
 print(f"[update] {{msg}}", flush=True)
 raise SystemExit(0 if ok else 1)
 PY
+  local rc=$?
+  cat "$phase_log" >> {q_debug_log} 2>&1 || true
+  while IFS= read -r line || [ -n "$line" ]; do
+    route_phase_output "$line"
+  done < "$phase_log"
+  rm -f "$phase_log"
+  return $rc
 }}
-log_line "[`date '+%Y-%m-%d %H:%M:%S'`] Update gestartet"
-log_line "[update-status] running"
+display_line "Update gestartet"
+status_line "[update-status] running"
 if [ -n "$current_version" ]; then
-  log_line "[update] Aktuell installiert: v$current_version"
+  display_line "Aktuell installiert: v$current_version"
 fi
 if [ -n "$target_version" ]; then
-  log_line "[update] Ziel-Release: v$target_version"
+  display_line "Ziel-Release: v$target_version"
 else
-  log_line "[update] Ziel-Release wird geprüft"
+  display_line "Ziel-Release wird geprüft"
 fi
 if [ -f {q_update} ] && [ ! -x {q_update} ]; then
   chmod +x {q_update} >> {q_debug_log} 2>&1 || true
 fi
 if [ ! -x {q_update} ]; then
-  log_line "[update] Die Update-Datei fehlt oder ist nicht ausführbar."
-  log_line "[update-status] done rc=1"
+  display_line "Die Update-Datei fehlt oder ist nicht ausführbar."
+  status_line "[update-status] done rc=1"
   exit 1
 fi
-log_line "[update] Vorbereitungen laufen"
+display_line "Vorbereitungen laufen"
 run_update_phase pre
 rc=$?
 if [ "$rc" -ne 0 ]; then
-  log_line "[update] Das Update wurde vor dem Einspielen abgebrochen."
-  log_line "[update-status] done rc=$rc"
+  display_line "Das Update wurde vor dem Einspielen abgebrochen."
+  status_line "[update-status] done rc=$rc"
   exit $rc
 fi
 if [ -n "$target_version" ]; then
-  log_line "[update] Das Release v$target_version wird eingespielt"
+  display_line "Das Release v$target_version wird eingespielt"
 else
-  log_line "[update] Das neue Release wird eingespielt"
+  display_line "Das neue Release wird eingespielt"
 fi
 {q_update} >> {q_debug_log} 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then
-  log_line "[update] Das Release konnte nicht installiert werden."
+  display_line "Das Release konnte nicht installiert werden."
   if [ -s {q_debug_log} ]; then
-    log_line "[update] Technischer Auszug:"
-    tail -n 40 {q_debug_log} >> {q_log} 2>&1 || true
+    display_line "Technischer Auszug siehe Technisches Log"
   fi
-  log_line "[update-status] done rc=$rc"
+  status_line "[update-status] done rc=$rc"
   exit $rc
 fi
 installed_version=$({q_python} - <<'PY'
@@ -6368,24 +6401,23 @@ if match:
 PY
 )
 if [ -n "$installed_version" ]; then
-  log_line "[update] Installiert: v$installed_version"
+  display_line "Installiert: v$installed_version"
 else
-  log_line "[update] Das Release ist installiert"
+  display_line "Das Release ist installiert"
 fi
-log_line "[update] Backup und Worker-Neustart laufen"
+display_line "Backup und Worker-Neustart laufen"
 run_update_phase post
 rc=$?
 if [ "$rc" -ne 0 ]; then
-  log_line "[update] Das Release ist installiert, aber der LXS-Nachlauf ist fehlgeschlagen."
+  display_line "Das Release ist installiert, aber der LXS-Nachlauf ist fehlgeschlagen."
   if [ -s {q_debug_log} ]; then
-    log_line "[update] Technischer Auszug:"
-    tail -n 40 {q_debug_log} >> {q_log} 2>&1 || true
+    display_line "Technischer Auszug siehe Technisches Log"
   fi
-  log_line "[update-status] done rc=$rc"
+  status_line "[update-status] done rc=$rc"
   exit $rc
 fi
-log_line "[update] Das Update ist vollständig abgeschlossen"
-log_line "[update-status] done rc=0"
+display_line "Das Update ist vollständig abgeschlossen"
+status_line "[update-status] done rc=0"
 exit 0
 """
 
@@ -6429,6 +6461,70 @@ def append_update_progress_line(message: str, *, debug: bool = False) -> None:
             handle.write(text + "\n")
     except Exception:
         pass
+
+
+def route_update_display_line(handle: Any, message: str) -> None:
+    text = str(message or "").strip()
+    if not text:
+        return
+    if "SyntaxWarning: invalid escape sequence" in text:
+        return
+    if text.lstrip().startswith("let m = text.match("):
+        return
+    if "MariaDB-State nicht verfuegbar" in text:
+        return
+    if text.startswith("[update] "):
+        text = text[len("[update] "):].strip()
+    elif text.startswith("[WARN] "):
+        text = "WARN: " + text[len("[WARN] "):].strip()
+    elif text.startswith("[update-status] "):
+        return
+    timestamp = time.strftime("%H:%M:%S")
+    handle.write(f"[{timestamp}] {text}\n")
+
+
+def clean_update_display_log(text: str) -> str:
+    lines = str(text or "").splitlines()
+    cleaned: list[str] = []
+    skip_next_match_line = False
+    for raw in lines:
+        line = str(raw or "")
+        stripped = line.strip()
+        if skip_next_match_line and stripped.startswith("let m = text.match("):
+            skip_next_match_line = False
+            continue
+        skip_next_match_line = False
+        if not stripped:
+            cleaned.append("")
+            continue
+        if "SyntaxWarning: invalid escape sequence" in stripped:
+            skip_next_match_line = True
+            continue
+        if "MariaDB-State nicht verfuegbar" in stripped:
+            continue
+        if stripped.startswith("[update-status] "):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
+def clean_update_debug_log(text: str) -> str:
+    lines = str(text or "").splitlines()
+    cleaned: list[str] = []
+    for raw in lines:
+        line = str(raw or "")
+        stripped = line.strip()
+        if not stripped:
+            cleaned.append("")
+            continue
+        if (
+            stripped.startswith("{\"job\":")
+            and "\"status_table\":" in stripped
+            and "\"workers\":" in stripped
+        ):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
 
 
 def abort_system_update() -> tuple[bool, str]:
@@ -6612,8 +6708,10 @@ def api_system_update_stop():
 def api_system_update_status():
     update_log = LOG_DIR / "system-update.log"
     update_debug_log = LOG_DIR / "system-update-debug.log"
-    log_text = tail_file(update_log, lines=360, max_chars=120000)
-    debug_log_text = tail_file(update_debug_log, lines=360, max_chars=120000)
+    raw_log_text = tail_file(update_log, lines=360, max_chars=120000)
+    raw_debug_log_text = tail_file(update_debug_log, lines=360, max_chars=120000)
+    log_text = clean_update_display_log(raw_log_text)
+    debug_log_text = clean_update_debug_log(raw_debug_log_text)
     log_exists = update_log.exists()
     debug_log_exists = update_debug_log.exists()
     log_size = 0
@@ -6642,7 +6740,7 @@ def api_system_update_status():
     success = False
     return_code = None
     if log_text:
-        markers = re.findall(r"\[update-status\]\s+(running|done(?:\s+rc=(\d+))?)", log_text, flags=re.IGNORECASE)
+        markers = re.findall(r"\[update-status\]\s+(running|done(?:\s+rc=(\d+))?)", raw_log_text, flags=re.IGNORECASE)
         if markers:
             last_marker = markers[-1][0].strip().lower()
             if last_marker.startswith("done"):
@@ -13331,6 +13429,21 @@ TEMPLATE = """
       gap: 10px;
       min-height: 0;
     }
+    .update-progress-section {
+      display: grid;
+      gap: 8px;
+      min-height: 0;
+    }
+    .update-progress-section.collapsed .update-progress-pre {
+      display: none;
+    }
+    .update-progress-log-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 0;
+    }
     .update-progress-status {
       font-size: 0.95rem;
       line-height: 1.4;
@@ -14593,10 +14706,20 @@ TEMPLATE = """
       </div>
       <div class="update-progress-body">
         <div id="updateProgressStatus" class="update-progress-status">Noch kein Update gestartet.</div>
-        <div class="update-progress-log-label">Ablauf</div>
-        <pre id="updateProgressPre" class="update-progress-pre">(leer)</pre>
-        <div class="update-progress-log-label">Technisches Log</div>
-        <pre id="updateProgressDebugPre" class="update-progress-pre">(leer)</pre>
+        <div id="updateProgressFlowSection" class="update-progress-section">
+          <div class="update-progress-log-head">
+            <div class="update-progress-log-label">Ablauf</div>
+            <button type="button" class="log-expand-btn collapse-toggle-btn" title="Einklappen" aria-label="Einklappen" onclick="toggleUpdateProgressSection('updateProgressFlowSection', this)">↙</button>
+          </div>
+          <pre id="updateProgressPre" class="update-progress-pre">(leer)</pre>
+        </div>
+        <div id="updateProgressDebugSection" class="update-progress-section">
+          <div class="update-progress-log-head">
+            <div class="update-progress-log-label">Technisches Log</div>
+            <button type="button" class="log-expand-btn collapse-toggle-btn" title="Einklappen" aria-label="Einklappen" onclick="toggleUpdateProgressSection('updateProgressDebugSection', this)">↙</button>
+          </div>
+          <pre id="updateProgressDebugPre" class="update-progress-pre">(leer)</pre>
+        </div>
         <div class="update-progress-actions">
           <button id="updateAbortBtn" type="button" class="btn btn-stop" onclick="requestUpdateAbort()">Abbrechen</button>
         </div>
@@ -15310,6 +15433,16 @@ TEMPLATE = """
       const btn = document.getElementById('updateAbortBtn');
       if (!btn) return;
       btn.disabled = !!updateAbortInFlight || !running || !canAbort || !!done;
+    }
+
+    function toggleUpdateProgressSection(sectionId, triggerBtn) {
+      const section = document.getElementById(sectionId);
+      if (!section) return;
+      const collapsed = !section.classList.contains('collapsed');
+      section.classList.toggle('collapsed', collapsed);
+      const buttons = section.querySelectorAll('.collapse-toggle-btn');
+      buttons.forEach((btn) => updateCollapseButton(btn, collapsed));
+      if (triggerBtn) updateCollapseButton(triggerBtn, collapsed);
     }
 
     function stopUpdateStatusPolling() {

@@ -111,19 +111,36 @@ wait_for_health() {
   fi
   local scheme="https"
   local curl_flags="-ksS"
+  local health_url=""
   if [ "$tls" = "0" ]; then
     scheme="http"
     curl_flags="-fsS"
   fi
+  health_url="${scheme}://${bind}:${port}/api/state"
   local attempt
   for attempt in $(seq 1 90); do
-    if curl $curl_flags "${scheme}://${bind}:${port}/api/state" >/dev/null 2>&1; then
-      curl $curl_flags "${scheme}://${bind}:${port}/api/state"
+    if curl $curl_flags "$health_url" >/tmp/managemovie-update-health.json 2>/dev/null; then
+      python3 - <<'PY'
+import json
+from pathlib import Path
+
+payload = Path("/tmp/managemovie-update-health.json")
+version = ""
+try:
+    data = json.loads(payload.read_text(encoding="utf-8", errors="replace"))
+    version = str(((data.get("versioning") or {}).get("current") or "")).strip()
+except Exception:
+    version = ""
+if version:
+    print(f"Healthcheck OK: version={version}")
+else:
+    print("Healthcheck OK")
+PY
       return 0
     fi
     sleep 2
   done
-  echo "Healthcheck fehlgeschlagen: ${scheme}://${bind}:${port}/api/state" >&2
+  echo "Healthcheck fehlgeschlagen: ${health_url}" >&2
   return 1
 }
 
@@ -167,12 +184,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-git clone --depth 1 "$REMOTE_URL" "$TMP_DIR/repo" >/dev/null
+git clone "$REMOTE_URL" "$TMP_DIR/repo" >/dev/null
 git -C "$TMP_DIR/repo" fetch --tags --force >/dev/null
 if [ -n "$target_ref" ]; then
   git -C "$TMP_DIR/repo" -c advice.detachedHead=false checkout --force "$target_ref" >/dev/null
 elif [ "$USE_BRANCH" -eq 1 ]; then
   git -C "$TMP_DIR/repo" checkout --force "$BRANCH" >/dev/null
+fi
+
+checked_version="$(grep -E -m1 '^VERSION = "[0-9]+\.[0-9]+\.[0-9]+"' "$TMP_DIR/repo/managemovie-web/app/managemovie.py" | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' || true)"
+if [ -n "$target_version" ] && [ -n "$checked_version" ] && [ "$checked_version" != "$target_version" ]; then
+  echo "[update] Falsche Version ausgecheckt: erwartet ${target_version}, bekommen ${checked_version}" >&2
+  exit 1
 fi
 
 rsync -a --delete \
