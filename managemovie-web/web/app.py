@@ -178,10 +178,10 @@ STATE_DB_RETRY_COOLDOWN_SEC = 20.0
 app = Flask(__name__)
 
 DEFAULT_WORKER_SPECS = (
-    {"name": "mamow01", "host": "mamow01", "node": "pve01", "ctid": "241", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:01"},
-    {"name": "mamow02", "host": "mamow02", "node": "pve02", "ctid": "242", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:02"},
-    {"name": "mamow03", "host": "mamow03", "node": "pve03", "ctid": "243", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:03"},
-    {"name": "mamow04", "host": "mamow04", "node": "pve04", "ctid": "244", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:04"},
+    {"name": "mamow01", "host": "mamow01", "node": "pve01", "ctid": "241", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_vaapi", "hwaddr": "42:4D:AE:00:F4:01"},
+    {"name": "mamow02", "host": "mamow02", "node": "pve02", "ctid": "242", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_vaapi", "hwaddr": "42:4D:AE:00:F4:02"},
+    {"name": "mamow03", "host": "mamow03", "node": "pve03", "ctid": "243", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_vaapi", "hwaddr": "42:4D:AE:00:F4:03"},
+    {"name": "mamow04", "host": "mamow04", "node": "pve04", "ctid": "244", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_vaapi", "hwaddr": "42:4D:AE:00:F4:04"},
 )
 WORKER_STATUS_CACHE_TTL_SEC = 10.0
 DEFAULT_WORKER_NAS_EXPORT = "192.168.100.201:/mnt/pool2_5x8tb/media3"
@@ -399,7 +399,7 @@ def read_worker_specs() -> list[dict[str, str]]:
                     "mount_root": parts[4] if len(parts) > 4 and parts[4] else "/mnt/Movie",
                     "rootfs_size_gb": parts[5] if len(parts) > 5 and parts[5] else "6",
                     "swap_mb": parts[6] if len(parts) > 6 and parts[6] else "4096",
-                    "default_encoder": parts[7] if len(parts) > 7 and parts[7] else "intel_qsv",
+                    "default_encoder": parts[7] if len(parts) > 7 and parts[7] else "intel_vaapi",
                 }
             )
     if not specs:
@@ -3716,6 +3716,7 @@ def _fallback_live_e_gb(q_gb_text: Any, e_gb_text: Any, *, running: bool) -> str
 
 WORKER_REMOTE_STATUS_TABLE = "/opt/managemovie/MovieManager/work/gemini-status-table.txt"
 WORKER_METRIC_CACHE: dict[str, dict[str, str]] = {}
+SOURCE_FPS_CACHE: dict[str, float] = {}
 
 
 def _worker_metric_cache_key(worker_name: str, source_name: str) -> str:
@@ -3990,6 +3991,111 @@ def _metric_to_float(value: Any) -> float:
         return float(match.group(0))
     except Exception:
         return 0.0
+
+
+def _dispatch_source_abs_path(item: dict[str, Any]) -> Path | None:
+    source_name = str(item.get("source_name", "") or "").strip()
+    if not source_name:
+        return None
+    source_path = Path(source_name).expanduser()
+    if source_path.is_absolute():
+        return source_path
+    folder = ""
+    with dispatch_lock:
+        if dispatch_master_job:
+            folder = str(dispatch_master_job.folder or "").strip()
+    if not folder:
+        job = dispatch_job_data() or {}
+        folder = str(job.get("folder", "") or "").strip()
+    if not folder:
+        return None
+    try:
+        return (Path(folder).expanduser() / source_path).resolve()
+    except Exception:
+        return Path(folder).expanduser() / source_path
+
+
+def _probe_source_fps_cached(source_path: Path | None) -> float:
+    if source_path is None:
+        return 0.0
+    key = str(source_path)
+    cached = SOURCE_FPS_CACHE.get(key)
+    if cached is not None:
+        return float(cached or 0.0)
+    if not source_path.exists() or not source_path.is_file():
+        SOURCE_FPS_CACHE[key] = 0.0
+        return 0.0
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate",
+        "-of",
+        "json",
+        str(source_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=8)
+        if result.returncode != 0 or not str(result.stdout or "").strip():
+            SOURCE_FPS_CACHE[key] = 0.0
+            return 0.0
+        payload = json.loads(result.stdout)
+        streams = payload.get("streams", [])
+        if not isinstance(streams, list) or not streams:
+            SOURCE_FPS_CACHE[key] = 0.0
+            return 0.0
+        stream = streams[0] if isinstance(streams[0], dict) else {}
+        for raw in (stream.get("avg_frame_rate"), stream.get("r_frame_rate")):
+            text = str(raw or "").strip()
+            if not text or text in {"0/0", "N/A", "n/a"}:
+                continue
+            if "/" in text:
+                left, right = text.split("/", 1)
+                try:
+                    num = float(left)
+                    den = float(right)
+                    if den:
+                        fps = num / den
+                        SOURCE_FPS_CACHE[key] = fps
+                        return fps
+                except Exception:
+                    continue
+            try:
+                fps = float(text)
+                SOURCE_FPS_CACHE[key] = fps
+                return fps
+            except Exception:
+                continue
+    except Exception:
+        pass
+    SOURCE_FPS_CACHE[key] = 0.0
+    return 0.0
+
+
+def _normalize_live_encode_metrics(item: dict[str, Any], metrics: dict[str, str]) -> dict[str, str]:
+    out = {key: str((metrics or {}).get(key, "") or "").strip() for key in ("speed", "fps", "z_gb", "e_gb", "eta", "lzeit")}
+    fps_val = _metric_to_float(out.get("fps", ""))
+    if fps_val <= 0:
+        return out
+    speed_val = _metric_to_float(out.get("speed", ""))
+    source_fps = _probe_source_fps_cached(_dispatch_source_abs_path(item))
+    if source_fps <= 0:
+        return out
+    derived_speed = fps_val / source_fps
+    if derived_speed <= 0:
+        return out
+    out["speed"] = f"{derived_speed:.1f}x"
+    eta_text = str(out.get("eta", "") or "").strip()
+    eta_seconds = parse_eta_seconds_text(eta_text)
+    if eta_seconds > 0 and speed_val > 0:
+        scale = speed_val / derived_speed
+        corrected_eta = eta_seconds * scale
+        if corrected_eta > 0:
+            out["eta"] = format_total_eta(corrected_eta)
+    return out
 
 
 def _read_remote_target_size_gb(worker_host: str, remote_target_path: str) -> str:
@@ -4283,6 +4389,8 @@ def _build_dispatch_status_index() -> dict[str, dict[str, Any]]:
             status_metrics=status_metrics,
             job_metrics=job_metrics,
         )
+        if running:
+            metrics = _normalize_live_encode_metrics(item, metrics)
         entry = {
             "worker_name": worker_name,
             "source_name": source_name,
@@ -4404,6 +4512,8 @@ def build_worker_job_map() -> dict[str, list[dict[str, Any]]]:
             status_metrics=status_metrics,
             job_metrics=job_metrics,
         )
+        if running:
+            metrics = _normalize_live_encode_metrics(item, metrics)
         live_worker = live_worker_states.get(worker_name) or {}
         live_source = str(live_worker.get("active_source", "") or live_worker.get("active_job", "") or "").strip()
         live_target = str(live_worker.get("active_target", "") or "").strip()
@@ -4977,7 +5087,7 @@ def build_remote_ffmpeg_exec(folder: str, env: dict[str, str], worker: dict[str,
     remote_folder = map_folder_for_ffmpeg_worker(folder, worker)
     effective_env = dict(env)
     requested_encoder = normalize_encoder_mode(effective_env.get("MANAGEMOVIE_AUTOSTART_ENCODER", ""))
-    worker_default_encoder = normalize_encoder_mode(str(worker.get("default_encoder", "") or "").strip()) or "intel_qsv"
+    worker_default_encoder = normalize_encoder_mode(str(worker.get("default_encoder", "") or "").strip()) or "intel_vaapi"
     effective_env["MANAGEMOVIE_AUTOSTART_ENCODER"] = worker_default_encoder if requested_encoder in {"", "cpu"} else requested_encoder
     env_keys = [
         "PATH",
@@ -5061,17 +5171,20 @@ def build_remote_ffmpeg_command(folder: str, env: dict[str, str], worker: dict[s
 
 def normalize_encoder_mode(raw_value: str | None) -> str:
     raw = (raw_value or "").strip().lower()
-    hardware_default = "apple" if sys.platform == "darwin" else "intel_qsv"
+    hardware_default = "apple" if sys.platform == "darwin" else "intel_vaapi"
     aliases = {
         "software": "cpu",
         "sw": "cpu",
         "x265": "cpu",
         "libx265": "cpu",
-        "intel": "intel_qsv",
-        "qsv": "intel_qsv",
-        "quicksync": "intel_qsv",
-        "quick sync": "intel_qsv",
-        "hevc_qsv": "intel_qsv",
+        "intel": "intel_vaapi",
+        "qsv": "intel_vaapi",
+        "quicksync": "intel_vaapi",
+        "quick sync": "intel_vaapi",
+        "hevc_qsv": "intel_vaapi",
+        "vaapi": "intel_vaapi",
+        "intel_vaapi": "intel_vaapi",
+        "h264_vaapi": "intel_vaapi",
         "apple": "apple",
         "videotoolbox": "apple",
         "vt": "apple",
@@ -5081,7 +5194,7 @@ def normalize_encoder_mode(raw_value: str | None) -> str:
         "gpu": hardware_default,
     }
     mapped = aliases.get(raw, raw)
-    if mapped in {"cpu", "intel_qsv", "apple"}:
+    if mapped in {"cpu", "intel_vaapi", "apple"}:
         return mapped
     return ""
 
@@ -5094,7 +5207,7 @@ def available_encoder_options() -> list[tuple[str, str]]:
         ]
     return [
         ("cpu", "Software"),
-        ("intel_qsv", "Intel QuickSync"),
+        ("intel_vaapi", "Intel VAAPI"),
     ]
 
 
@@ -17582,7 +17695,7 @@ TEMPLATE = """
 
     function setEncoderControls(encoder) {
       let value = String(encoder || '').trim();
-      const allowed = new Set(Array.isArray(ALLOWED_ENCODERS) ? ALLOWED_ENCODERS : ['cpu', 'intel_qsv']);
+      const allowed = new Set(Array.isArray(ALLOWED_ENCODERS) ? ALLOWED_ENCODERS : ['cpu', 'intel_vaapi']);
       if (!allowed.has(value)) {
         value = allowed.has('cpu') ? 'cpu' : (Array.from(allowed)[0] || 'cpu');
       }

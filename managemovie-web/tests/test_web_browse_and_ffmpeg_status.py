@@ -158,7 +158,13 @@ class WebBrowseAndFfmpegStatusTests(unittest.TestCase):
 
     def test_ffmpeg_encoder_choices_hide_apple_on_linux(self) -> None:
         with patch.object(RUNNER_APP.sys, "platform", "linux"):
-            self.assertEqual(RUNNER_APP.ffmpeg_encoder_choices_text(), "cpu/intel_qsv")
+            self.assertEqual(RUNNER_APP.ffmpeg_encoder_choices_text(), "cpu/intel_vaapi")
+
+    def test_normalize_ffmpeg_encoder_mode_prefers_vaapi_for_generic_intel_alias(self) -> None:
+        with patch.object(RUNNER_APP.sys, "platform", "linux"):
+            self.assertEqual(RUNNER_APP.normalize_ffmpeg_encoder_mode("intel"), "intel_vaapi")
+            self.assertEqual(RUNNER_APP.normalize_ffmpeg_encoder_mode("hw"), "intel_vaapi")
+            self.assertEqual(RUNNER_APP.normalize_ffmpeg_encoder_mode("intel_qsv"), "intel_qsv")
 
     def test_validate_ffmpeg_runtime_encoder_mode_rejects_unavailable_qsv(self) -> None:
         with patch.object(RUNNER_APP, "detect_intel_qsv_support", return_value=(False, "kein /dev/dri/renderD128 im Container")), \

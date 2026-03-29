@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 from mmcore.db_cache import GeminiDbStore
 
-VERSION = "0.2.51"
+VERSION = "0.2.52"
 SCRIPT_NAME = f"managemovie_v{VERSION}.py"
 TMDB_ENABLED = (os.environ.get("MANAGEMOVIE_TMDB_ENABLED", "1") or "1").strip().lower() in {
     "1",
@@ -450,14 +450,14 @@ def normalize_ffmpeg_encoder_mode(value: str) -> str:
     raw = (value or "").strip().lower()
     if raw in {"cpu", "cpi", "software", "sw", "x265", "libx265"}:
         return "cpu"
-    if raw in {"intel", "intel_qsv", "qsv", "hevc_qsv", "quicksync", "quick sync"}:
+    if raw in {"intel_qsv", "qsv", "hevc_qsv", "quicksync", "quick sync"}:
         return "intel_qsv"
-    if raw in {"intel_vaapi", "vaapi", "h264_vaapi", "hevc_vaapi"}:
+    if raw in {"intel", "intel_vaapi", "vaapi", "h264_vaapi", "hevc_vaapi"}:
         return "intel_vaapi"
     if raw in {"apple", "videotoolbox", "vt", "hevc_videotoolbox"}:
         return "apple"
     if raw in {"hardware", "hw", "gpu"}:
-        return "apple" if sys.platform == "darwin" else "intel_qsv"
+        return "apple" if sys.platform == "darwin" else "intel_vaapi"
     return ""
 
 
@@ -484,7 +484,7 @@ def write_ffmpeg_encoder_default(mode: str) -> None:
 
 
 def available_ffmpeg_encoder_modes() -> list[str]:
-    modes = ["cpu", "intel_qsv"]
+    modes = ["cpu", "intel_vaapi"]
     if sys.platform == "darwin":
         modes.append("apple")
     return modes
@@ -4449,23 +4449,37 @@ def probe_video_fps(file_path: Path) -> float:
     return 0.0
 
 
-def effective_encode_speed(speed_val: float, progress_sec: float, started_ts: float, now_ts: float) -> float:
+def effective_encode_speed(
+    speed_val: float,
+    progress_sec: float,
+    started_ts: float,
+    now_ts: float,
+    *,
+    fps_val: float = 0.0,
+    source_fps: float = 0.0,
+) -> float:
+    if fps_val > 0 and source_fps > 0:
+        return fps_val / source_fps
+
     elapsed = max(1.0, now_ts - started_ts)
     measured_speed = 0.0
     if progress_sec > 0 and elapsed >= 5.0:
         measured_speed = progress_sec / elapsed
 
+    candidate = 0.0
     if speed_val > 0 and measured_speed > 0:
         # Prefer the progress-derived speed so ETA reacts to real output progress,
         # but keep ffmpeg's self-reported value as a stabilizer.
         if measured_speed < (speed_val * 0.25) or measured_speed > (speed_val * 4.0):
-            return speed_val
-        return (measured_speed * 0.65) + (speed_val * 0.35)
-    if speed_val > 0:
-        return speed_val
-    if measured_speed > 0:
-        return measured_speed
-    return 0.0
+            candidate = speed_val
+        else:
+            candidate = (measured_speed * 0.65) + (speed_val * 0.35)
+    elif speed_val > 0:
+        candidate = speed_val
+    elif measured_speed > 0:
+        candidate = measured_speed
+
+    return candidate
 
 
 def format_speed_text(speed_val: float) -> str:
@@ -6672,7 +6686,14 @@ def run_ffmpeg_encode_with_monitor(
         z_gb_text = format_live_gb_text(z_gb)
         raw_speed_val = parse_speed_float(last_speed_text)
         fps_val = parse_fps_float(last_fps_text)
-        speed_val = effective_encode_speed(raw_speed_val, out_time_sec, start_ts, now)
+        speed_val = effective_encode_speed(
+            raw_speed_val,
+            out_time_sec,
+            start_ts,
+            now,
+            fps_val=fps_val,
+            source_fps=source_fps,
+        )
         if speed_val <= 0 and fps_val > 0 and source_fps > 0:
             speed_val = fps_val / source_fps
         display_speed_text = format_speed_text(speed_val)
@@ -6756,7 +6777,14 @@ def run_ffmpeg_encode_with_monitor(
     z_gb_text = format_live_gb_text(z_gb)
     raw_speed_val = parse_speed_float(last_speed_text)
     fps_val = parse_fps_float(last_fps_text)
-    speed_val = effective_encode_speed(raw_speed_val, out_time_sec, start_ts, time.time())
+    speed_val = effective_encode_speed(
+        raw_speed_val,
+        out_time_sec,
+        start_ts,
+        time.time(),
+        fps_val=fps_val,
+        source_fps=source_fps,
+    )
     if speed_val <= 0 and fps_val > 0 and source_fps > 0:
         speed_val = fps_val / source_fps
     display_speed_text = format_speed_text(speed_val)
