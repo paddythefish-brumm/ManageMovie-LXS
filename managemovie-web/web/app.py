@@ -93,6 +93,7 @@ OUT_TREE_FILE = WORK_DIR / "out_tree.txt"
 PROCESSING_LOG_FILE = WORK_DIR / "processing_log.txt"
 OUT_PLAN_FILE = WORK_DIR / "out_plan.txt"
 CONFIRM_FILE = WORK_DIR / "web-confirm.json"
+DISPATCH_RUNTIME_ROWS_FILE = WORK_DIR / "dispatch-runtime-rows.json"
 DEFAULT_FOLDER = detect_default_folder()
 BROWSE_ROOT = detect_browse_root()
 VERSION_STATE_FILE = DATA_DIR / "VERSION.current"
@@ -177,10 +178,10 @@ STATE_DB_RETRY_COOLDOWN_SEC = 20.0
 app = Flask(__name__)
 
 DEFAULT_WORKER_SPECS = (
-    {"name": "mamow01", "host": "mamow01", "node": "pve01", "ctid": "241", "mount_root": "/mnt/Q-NAS", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:01"},
-    {"name": "mamow02", "host": "mamow02", "node": "pve02", "ctid": "242", "mount_root": "/mnt/Q-NAS", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:02"},
-    {"name": "mamow03", "host": "mamow03", "node": "pve03", "ctid": "243", "mount_root": "/mnt/Q-NAS", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:03"},
-    {"name": "mamow04", "host": "mamow04", "node": "pve04", "ctid": "244", "mount_root": "/mnt/Q-NAS", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:04"},
+    {"name": "mamow01", "host": "mamow01", "node": "pve01", "ctid": "241", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:01"},
+    {"name": "mamow02", "host": "mamow02", "node": "pve02", "ctid": "242", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:02"},
+    {"name": "mamow03", "host": "mamow03", "node": "pve03", "ctid": "243", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:03"},
+    {"name": "mamow04", "host": "mamow04", "node": "pve04", "ctid": "244", "mount_root": "/mnt/Movie", "rootfs_size_gb": "6", "swap_mb": "4096", "default_encoder": "intel_qsv", "hwaddr": "42:4D:AE:00:F4:04"},
 )
 WORKER_STATUS_CACHE_TTL_SEC = 10.0
 DEFAULT_WORKER_NAS_EXPORT = "192.168.100.201:/mnt/pool2_5x8tb/media3"
@@ -394,7 +395,7 @@ def read_worker_specs() -> list[dict[str, str]]:
                     "host": parts[1] if len(parts) > 1 and parts[1] else name,
                     "node": parts[2] if len(parts) > 2 else "",
                     "ctid": parts[3] if len(parts) > 3 else "",
-                    "mount_root": parts[4] if len(parts) > 4 and parts[4] else "/mnt/Q-NAS",
+                    "mount_root": parts[4] if len(parts) > 4 and parts[4] else "/mnt/Movie",
                     "rootfs_size_gb": parts[5] if len(parts) > 5 and parts[5] else "6",
                     "swap_mb": parts[6] if len(parts) > 6 and parts[6] else "4096",
                     "default_encoder": parts[7] if len(parts) > 7 and parts[7] else "intel_qsv",
@@ -491,7 +492,7 @@ def apply_worker_profile(spec: dict[str, str]) -> tuple[bool, str]:
     worker_name = str(spec.get("name", "") or "").strip() or "worker"
     node = str(spec.get("node", "") or "").strip()
     ctid = str(spec.get("ctid", "") or "").strip()
-    mount_root = str(spec.get("mount_root", "") or "").strip() or "/mnt/Q-NAS"
+    mount_root = str(spec.get("mount_root", "") or "").strip() or "/mnt/Movie"
     master_pub = read_master_public_ssh_key()
     if not node or not ctid:
         return False, "Node/CT-ID fehlt"
@@ -570,7 +571,7 @@ systemctl enable --now ssh >/dev/null 2>&1 || true
 
 def ensure_worker_mount_ready(spec: dict[str, str], timeout: int = 90) -> tuple[bool, str]:
     worker_host = str(spec.get("host", "") or "").strip() or str(spec.get("name", "") or "").strip()
-    mount_root = str(spec.get("mount_root", "") or "").strip() or "/mnt/Q-NAS"
+    mount_root = str(spec.get("mount_root", "") or "").strip() or "/mnt/Movie"
     export_path = worker_nas_export()
     if not worker_host:
         return False, "Worker-Host fehlt"
@@ -887,12 +888,12 @@ def read_runtime_settings() -> dict[str, str]:
             STATE_KEY_AI_QUERY_DISABLED: "1",
             STATE_KEY_SKIP_H265_ENCODE: "0",
             STATE_KEY_SKIP_4K_H265_ENCODE: "0",
-            STATE_KEY_ENCODE_ONCE_4K: "1",
-            STATE_KEY_ONE_ENCODE_PER_WORKER: "0",
-            STATE_KEY_ALLOW_WORKER_4: "0",
+            STATE_KEY_ENCODE_ONCE_4K: "0",
+            STATE_KEY_ONE_ENCODE_PER_WORKER: "1",
+            STATE_KEY_ALLOW_WORKER_4: "1",
             STATE_KEY_PARALLEL_JOB_LIMIT: "2",
-            STATE_KEY_PRECHECK_EGB: "1",
-            STATE_KEY_SPEED_FALLBACK_COPY: "1",
+            STATE_KEY_PRECHECK_EGB: "0",
+            STATE_KEY_SPEED_FALLBACK_COPY: "0",
             STATE_KEY_START_ON_BOOT: default_start_on_boot,
             STATE_KEY_INITIAL_SETUP_DONE: "0" if initial_settings_gate_enabled() else "1",
         }
@@ -919,12 +920,12 @@ def read_runtime_settings() -> dict[str, str]:
         "gemini_api": state_values.get(STATE_KEY_GEMINI_API, ""),
         "ai_query_disabled": "1" if parse_form_bool(state_values.get(STATE_KEY_AI_QUERY_DISABLED, "1")) else "0",
         "skip_4k_h265_encode": "1" if parse_form_bool(state_values.get(STATE_KEY_SKIP_4K_H265_ENCODE, "0")) else "0",
-        "encode_once_4k": "1" if parse_form_bool(state_values.get(STATE_KEY_ENCODE_ONCE_4K, "1")) else "0",
-        "one_encode_per_worker": "1" if parse_form_bool(state_values.get(STATE_KEY_ONE_ENCODE_PER_WORKER, "0")) else "0",
-        "allow_worker_4": "1" if parse_form_bool(state_values.get(STATE_KEY_ALLOW_WORKER_4, "0")) else "0",
+        "encode_once_4k": "0",
+        "one_encode_per_worker": "1" if parse_form_bool(state_values.get(STATE_KEY_ONE_ENCODE_PER_WORKER, "1")) else "0",
+        "allow_worker_4": "1" if parse_form_bool(state_values.get(STATE_KEY_ALLOW_WORKER_4, "1")) else "0",
         "parallel_job_limit": parallel_job_limit,
-        "precheck_egb": "1" if parse_form_bool(state_values.get(STATE_KEY_PRECHECK_EGB, "1")) else "0",
-        "speed_fallback_copy": "1" if parse_form_bool(state_values.get(STATE_KEY_SPEED_FALLBACK_COPY, "1")) else "0",
+        "precheck_egb": "1" if parse_form_bool(state_values.get(STATE_KEY_PRECHECK_EGB, "0")) else "0",
+        "speed_fallback_copy": "1" if parse_form_bool(state_values.get(STATE_KEY_SPEED_FALLBACK_COPY, "0")) else "0",
         "start_on_boot": "1" if parse_form_bool(state_values.get(STATE_KEY_START_ON_BOOT, default_start_on_boot)) else "0",
         "initial_setup_done": initial_setup_done,
         "initial_setup_required": "1" if initial_settings_gate_enabled() else "0",
@@ -997,15 +998,12 @@ def update_runtime_settings(payload: dict | None) -> tuple[bool, str, dict[str, 
     gemini_api = apply_secret_update(source, "gemini_api", current["gemini_api"])
     ai_query_disabled = "1" if parse_form_bool(source.get("ai_query_disabled", current.get("ai_query_disabled", "1"))) else "0"
     skip_4k_h265_encode = "1" if parse_form_bool(source.get("skip_4k_h265_encode", current.get("skip_4k_h265_encode", "0"))) else "0"
-    encode_once_4k = "1" if parse_form_bool(source.get("encode_once_4k", current.get("encode_once_4k", "1"))) else "0"
-    one_encode_per_worker = "1" if parse_form_bool(source.get("one_encode_per_worker", current.get("one_encode_per_worker", "0"))) else "0"
-    allow_worker_4 = "1" if parse_form_bool(source.get("allow_worker_4", current.get("allow_worker_4", "0"))) else "0"
-    try:
-        parallel_job_limit = str(max(1, min(4, int(str(source.get("parallel_job_limit", current.get("parallel_job_limit", "2")) or "2").strip() or "2"))))
-    except Exception:
-        parallel_job_limit = current.get("parallel_job_limit", "2") or "2"
-    precheck_egb = "1" if parse_form_bool(source.get("precheck_egb", current.get("precheck_egb", "1"))) else "0"
-    speed_fallback_copy = "1" if parse_form_bool(source.get("speed_fallback_copy", current.get("speed_fallback_copy", "1"))) else "0"
+    encode_once_4k = "0"
+    one_encode_per_worker = "1" if parse_form_bool(source.get("one_encode_per_worker", current.get("one_encode_per_worker", "1"))) else "0"
+    allow_worker_4 = "1" if parse_form_bool(source.get("allow_worker_4", current.get("allow_worker_4", "1"))) else "0"
+    parallel_job_limit = "2"
+    precheck_egb = "1" if parse_form_bool(source.get("precheck_egb", current.get("precheck_egb", "0"))) else "0"
+    speed_fallback_copy = "1" if parse_form_bool(source.get("speed_fallback_copy", current.get("speed_fallback_copy", "0"))) else "0"
     start_on_boot = "1" if parse_form_bool(source.get("start_on_boot", current.get("start_on_boot", "1"))) else "0"
     encoder = coerce_encoder_for_ui(source.get("encoder", read_last_encoder()))
 
@@ -1042,10 +1040,10 @@ def update_runtime_settings(payload: dict | None) -> tuple[bool, str, dict[str, 
     persist_field("ai_query_disabled", lambda: write_state_value(STATE_KEY_AI_QUERY_DISABLED, ai_query_disabled))
     persist_field("skip_h265_encode", lambda: write_state_value(STATE_KEY_SKIP_H265_ENCODE, "0"))
     persist_field("skip_4k_h265_encode", lambda: write_state_value(STATE_KEY_SKIP_4K_H265_ENCODE, skip_4k_h265_encode))
-    persist_field("encode_once_4k", lambda: write_state_value(STATE_KEY_ENCODE_ONCE_4K, encode_once_4k))
+    persist_field("encode_once_4k", lambda: write_state_value(STATE_KEY_ENCODE_ONCE_4K, "0"))
     persist_field("one_encode_per_worker", lambda: write_state_value(STATE_KEY_ONE_ENCODE_PER_WORKER, one_encode_per_worker))
     persist_field("allow_worker_4", lambda: write_state_value(STATE_KEY_ALLOW_WORKER_4, allow_worker_4))
-    persist_field("parallel_job_limit", lambda: write_state_value(STATE_KEY_PARALLEL_JOB_LIMIT, parallel_job_limit))
+    persist_field("parallel_job_limit", lambda: write_state_value(STATE_KEY_PARALLEL_JOB_LIMIT, "2"))
     persist_field("precheck_egb", lambda: write_state_value(STATE_KEY_PRECHECK_EGB, precheck_egb))
     persist_field("speed_fallback_copy", lambda: write_state_value(STATE_KEY_SPEED_FALLBACK_COPY, speed_fallback_copy))
     persist_field("start_on_boot", lambda: write_state_value(STATE_KEY_START_ON_BOOT, start_on_boot))
@@ -1227,6 +1225,12 @@ def truncate_text_file(path: Path) -> None:
 def clear_log_windows_data() -> None:
     for path in (STATUS_FILE, OUT_TREE_FILE, OUT_PLAN_FILE, PROCESSING_LOG_FILE):
         truncate_text_file(path)
+    try:
+        DISPATCH_RUNTIME_ROWS_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 def clear_confirmation_file() -> None:
@@ -3397,28 +3401,26 @@ def ffmpeg_remote_path_map() -> tuple[str, str] | None:
 
 
 def map_folder_for_ffmpeg_worker(folder: str, worker: dict[str, str] | None = None) -> str:
-    mapped = ffmpeg_remote_path_map()
-    if not mapped:
-        mount_root = str((worker or {}).get("mount_root", "") or "").strip()
-        if mount_root:
-            source = str(Path(read_runtime_settings().get("target_nfs_path", DEFAULT_TARGET_NFS_PATH)).expanduser()).rstrip("/")
-            target = mount_root.rstrip("/")
-            resolved = str(Path(folder).expanduser())
-            if resolved == source:
-                return target
-            prefix = source + os.sep
-            if resolved.startswith(prefix):
-                suffix = resolved[len(prefix):]
-                return str(Path(target) / suffix) if suffix else target
-        return folder
-    source, target = mapped
     resolved = str(Path(folder).expanduser())
-    if resolved == source:
-        return target
-    prefix = source + os.sep
-    if resolved.startswith(prefix):
-        suffix = resolved[len(prefix):]
-        return str(Path(target) / suffix) if suffix else target
+    mount_root = str((worker or {}).get("mount_root", "") or "").strip().rstrip("/")
+    if mount_root:
+        # Worker mount_root is the current source of truth. Keep paths under the
+        # same shared mount unchanged and rewrite only legacy /mnt/<share> roots.
+        if resolved == mount_root or resolved.startswith(mount_root + os.sep):
+            return resolved
+        legacy_mount_match = re.match(r"^(/mnt/[^/]+)(?:/(.*))?$", resolved)
+        if legacy_mount_match:
+            suffix = str(legacy_mount_match.group(2) or "").strip()
+            return str(Path(mount_root) / suffix) if suffix else mount_root
+    mapped = ffmpeg_remote_path_map()
+    if mapped:
+        source, target = mapped
+        if resolved == source:
+            return target
+        prefix = source + os.sep
+        if resolved.startswith(prefix):
+            suffix = resolved[len(prefix):]
+            return str(Path(target) / suffix) if suffix else target
     return folder
 
 
@@ -3939,6 +3941,17 @@ def _format_gb_two_decimals(size_bytes: int) -> str:
     return f"{value:.2f}"
 
 
+def _metric_to_float(value: Any) -> float:
+    text = str(value or "").strip().replace(",", ".")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(0))
+    except Exception:
+        return 0.0
+
+
 def _read_remote_target_size_gb(worker_host: str, remote_target_path: str) -> str:
     host = str(worker_host or "").strip()
     target = str(remote_target_path or "").strip()
@@ -3996,13 +4009,13 @@ def _prefer_live_completed_metrics(base: dict[str, str], preferred: dict[str, st
     if (not str(out.get("lzeit", "") or "").strip() or str(out.get("lzeit", "") or "").strip().lower() in {"n/a", "-", "na"}) and str(pref.get("lzeit", "") or "").strip():
         out["lzeit"] = pref["lzeit"]
     z_text = str(out.get("z_gb", "") or "").strip()
-    z_num = _to_float(z_text)
+    z_num = _metric_to_float(z_text)
     pref_z = str(pref.get("z_gb", "") or "").strip()
-    pref_z_num = _to_float(pref_z)
+    pref_z_num = _metric_to_float(pref_z)
     if pref_z_num > z_num:
         out["z_gb"] = pref_z
-    q_num = _to_float(q_gb)
-    z_final = _to_float(out.get("z_gb", ""))
+    q_num = _metric_to_float(q_gb)
+    z_final = _metric_to_float(out.get("z_gb", ""))
     if q_num > 0 and z_final >= 0:
         saved_pct = max(0.0, ((q_num - z_final) / q_num) * 100.0)
         out["e_gb"] = f"{int(round(saved_pct))}%"
@@ -4144,6 +4157,69 @@ def _dispatch_item_precedence_key(item: dict[str, Any]) -> tuple[int, int, float
     return (running, success, started_at)
 
 
+def persist_runtime_rows_snapshot(rows: list[dict[str, Any]]) -> None:
+    try:
+        DISPATCH_RUNTIME_ROWS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DISPATCH_RUNTIME_ROWS_FILE.write_text(json.dumps(rows or [], ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    if not init_state_store():
+        return
+    try:
+        STATE_DB_STORE.write_state_many(
+            [
+                ("runtime.gemini_rows_json", json.dumps(rows or [], ensure_ascii=False)),
+                ("runtime.gemini_rows_count", str(len(rows or []))),
+                ("runtime.gemini_rows_updated_unix", str(int(time.time()))),
+            ]
+        )
+    except Exception:
+        pass
+
+
+def update_dispatch_runtime_row_for_item(
+    item: dict[str, Any],
+    *,
+    metrics: dict[str, Any] | None = None,
+    completed: bool | None = None,
+) -> None:
+    source_name = str(item.get("source_name", "") or "").strip()
+    target_name = str(item.get("target_name", "") or "").strip()
+    worker_name = str(item.get("worker_name", "") or "").strip()
+    if not source_name:
+        return
+    row_keys = _dispatch_row_match_keys(source_name, target_name)
+    if not row_keys:
+        return
+    snapshot_rows: list[dict[str, Any]] | None = None
+    with dispatch_lock:
+        if not dispatch_runtime_rows:
+            return
+        changed = False
+        for idx, row in enumerate(dispatch_runtime_rows):
+            candidate_keys = _dispatch_row_match_keys(row.get("source_name", ""), row.get("target_name", ""))
+            if not any(key in candidate_keys for key in row_keys):
+                continue
+            updated = dict(row)
+            if worker_name:
+                updated["worker_name"] = worker_name
+            if target_name:
+                updated["target_name"] = target_name
+            for key in ("speed", "fps", "z_gb", "e_gb", "eta", "lzeit"):
+                value = str((metrics or {}).get(key, "") or "").strip()
+                if value:
+                    updated[key] = value
+            if completed is not None:
+                updated["completed"] = bool(completed)
+            dispatch_runtime_rows[idx] = updated
+            changed = True
+            break
+        if changed:
+            snapshot_rows = [dict(row) for row in dispatch_runtime_rows]
+    if snapshot_rows is not None:
+        persist_runtime_rows_snapshot(snapshot_rows)
+
+
 def _build_dispatch_status_index() -> dict[str, dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     live_worker_states = {
@@ -4218,7 +4294,7 @@ def annotate_runtime_rows_with_dispatch_status(rows: list[dict[str, Any]]) -> li
     annotated: list[dict[str, Any]] = []
     for row in rows:
         out = dict(row)
-        out["completed"] = False
+        out["completed"] = bool(row.get("completed"))
         match: dict[str, Any] | None = None
         for key in _dispatch_row_match_keys(out.get("source_name", ""), out.get("target_name", "")):
             candidate = status_index.get(key)
@@ -4278,10 +4354,13 @@ def build_worker_job_map() -> dict[str, list[dict[str, Any]]]:
         source_name = str(item.get("source_name", "") or "").strip()
         if not worker_name or not source_name:
             continue
+        running = bool(item.get("running"))
+        worker_host = str(item.get("worker_host", "") or "").strip()
+        remote_target_path = str(item.get("remote_target_path", "") or "").strip()
         status_metrics, snapshot = _read_worker_status_metrics(item)
         job_metrics = _read_worker_job_metrics(item)
         metrics = _merge_worker_metric_sources(
-            running=bool(item.get("running")),
+            running=running,
             status_metrics=status_metrics,
             job_metrics=job_metrics,
         )
@@ -4308,17 +4387,17 @@ def build_worker_job_map() -> dict[str, list[dict[str, Any]]]:
             eta_text = eta_text or str(live_worker.get("active_eta", "") or "").strip()
             z_gb_text = z_gb_text or str(live_worker.get("active_z_gb", "") or "").strip()
             e_gb_text = e_gb_text or str(live_worker.get("active_e_gb", "") or "").strip()
-        if running and (_to_float(z_gb_text) <= 0.0) and remote_target_path:
+        if running and (_metric_to_float(z_gb_text) <= 0.0) and remote_target_path:
             remote_z = _read_remote_target_size_gb(worker_host, remote_target_path)
-            if _to_float(remote_z) > 0.0:
+            if _metric_to_float(remote_z) > 0.0:
                 z_gb_text = remote_z
-        e_gb_text = _fallback_live_e_gb(item.get("q_gb", ""), e_gb_text, running=bool(item.get("running")))
+        e_gb_text = _fallback_live_e_gb(item.get("q_gb", ""), e_gb_text, running=running)
         grouped.setdefault(worker_name, []).append(
             {
                 "source_name": source_name,
                 "file_name": Path(source_name).name,
                 "target_name": str((snapshot or {}).get("target", "") or item.get("target_name", "") or live_target or "").strip(),
-                "running": bool(item.get("running")),
+                "running": running,
                 "exit_code": item.get("exit_code"),
                 "speed": speed_text,
                 "fps": fps_text,
@@ -4431,7 +4510,7 @@ def choose_ffmpeg_worker() -> dict[str, Any]:
         return worker
     fallback = ffmpeg_remote_host()
     if fallback:
-        return {"name": fallback, "host": fallback, "mount_root": "/mnt/Q-NAS"}
+        return {"name": fallback, "host": fallback, "mount_root": "/mnt/Movie"}
     raise ValueError("Kein verfügbarer Worker für ffmpeg.")
 
 
@@ -4578,6 +4657,21 @@ def run_worker_action(worker_name: str, action: str) -> tuple[bool, str]:
         invalidate_worker_state_cache()
         append_processing_log(f"[worker:{name}] pausiert")
         return True, f"{name} pausiert."
+
+    if verb == "resume":
+        write_worker_enabled_state(name, True)
+        try:
+            run_worker_ssh(
+                host,
+                "pkill -CONT -f '[m]anagemovie.py --ffmpeg' >/dev/null 2>&1 || true; "
+                "pkill -CONT -x ffmpeg >/dev/null 2>&1 || true",
+                timeout=8,
+            )
+        except Exception:
+            pass
+        invalidate_worker_state_cache()
+        append_processing_log(f"[worker:{name}] fortgesetzt")
+        return True, f"{name} fortgesetzt."
 
     return False, f"Unbekannte Worker-Aktion: {verb}"
 
@@ -4873,6 +4967,9 @@ def build_env(
     env["MANAGEMOVIE_TERMINAL_UI"] = "0"
     env["MANAGEMOVIE_AUTOSTART"] = "1"
     env["MANAGEMOVIE_AUTOSTART_ENCODER"] = encoder or "cpu"
+    # Remote folder mapping is resolved on the master before dispatch. Do not
+    # leak stale service-level path maps into job subprocesses.
+    env.pop("MANAGEMOVIE_FFMPEG_REMOTE_PATH_MAP", None)
     # Web-initiated copy/encode must always go through browser confirmation.
     # Ignore inherited MANAGEMOVIE_SKIP_CONFIRM from service environments.
     env["MANAGEMOVIE_WEB_CONFIRM_FILE"] = str(CONFIRM_FILE)
@@ -4905,8 +5002,8 @@ def build_env(
     env["MANAGEMOVIE_DISABLE_AI_QUERY"] = "1" if ai_query_disabled else "0"
     env["MANAGEMOVIE_SKIP_H265_ENCODE"] = "0"
     env["MANAGEMOVIE_SKIP_4K_H265_ENCODE"] = "1" if skip_4k_h265_encode else "0"
-    env["MANAGEMOVIE_ENCODE_ONCE_4K"] = "1" if parse_form_bool(runtime_settings.get("encode_once_4k", "1")) else "0"
-    env["MANAGEMOVIE_PARALLEL_JOB_LIMIT"] = str(runtime_settings.get("parallel_job_limit", "2") or "2")
+    env["MANAGEMOVIE_ENCODE_ONCE_4K"] = "0"
+    env["MANAGEMOVIE_PARALLEL_JOB_LIMIT"] = "2"
     env["MANAGEMOVIE_PRECHECK_EGB"] = "1" if precheck_egb else "0"
     env["MANAGEMOVIE_SPEED_FALLBACK_COPY"] = "1" if speed_fallback_copy else "0"
     history_off_folder = read_history_off_start_folder()
@@ -5357,6 +5454,18 @@ def spawn_dispatch_subjob_monitor(job_id: str) -> None:
                 last_forwarded_lines = current_lines
             _, snapshot = _read_worker_status_metrics(item)
             if snapshot:
+                update_dispatch_runtime_row_for_item(
+                    item,
+                    metrics={
+                        "speed": str(snapshot.get("speed", "") or "").strip(),
+                        "fps": str(snapshot.get("fps", "") or "").strip(),
+                        "z_gb": str(snapshot.get("z_gb", "") or "").strip(),
+                        "e_gb": str(snapshot.get("e_gb", "") or "").strip(),
+                        "eta": str(snapshot.get("eta", "") or "").strip(),
+                        "lzeit": str(snapshot.get("lzeit", "") or "").strip(),
+                    },
+                    completed=False,
+                )
                 with dispatch_lock:
                     current = dispatch_subjobs.get(job_id)
                     if current is not None:
@@ -5421,6 +5530,17 @@ def spawn_dispatch_subjob_monitor(job_id: str) -> None:
                 current["running"] = False
                 current["exit_code"] = rc
                 current["ended_at"] = time.time()
+                item = dict(current)
+        final_metrics = dict((item.get("last_live_metrics", {}) or {}))
+        if not any(str(value or "").strip() for value in final_metrics.values()):
+            final_metrics = _read_worker_job_metrics(item)
+        if rc == 0:
+            duration_text = _format_duration_hms(
+                max(0.0, float(item.get("ended_at", 0.0) or 0.0) - float(item.get("started_at", 0.0) or 0.0))
+            )
+            if duration_text:
+                final_metrics["eta"] = duration_text
+        update_dispatch_runtime_row_for_item(item, metrics=final_metrics, completed=(rc == 0))
         worker_name = str(item.get("worker_name", "") or "").strip() or "-"
         if rc == 0:
             append_processing_log(f"[dispatch] {source_name} auf {worker_name}: OK")
@@ -5512,6 +5632,7 @@ def start_ffmpeg_dispatch_from_rows(
         dispatch_round_robin_cursor_name = ""
         dispatch_runtime_rows = [dict(row) for row in queue_rows]
         dispatch_worker_pool = [dict(worker) for worker in ready_workers] if ready_workers else [dict(worker) for worker in warmed_workers]
+    persist_runtime_rows_snapshot(queue_rows)
 
     def runner() -> None:
         global dispatch_master_job, dispatch_pending_rows, dispatch_runtime_rows, dispatch_worker_pool
@@ -5595,25 +5716,32 @@ def start_ffmpeg_dispatch_from_rows(
 
 
 def read_runtime_rows_for_dispatch(start_folder: str) -> list[dict[str, Any]]:
-    if not init_state_store():
-        return []
-    try:
-        raw_runtime = str(STATE_DB_STORE.read_state("runtime.gemini_rows_json") or "").strip()
-    except Exception:
-        return []
+    raw_runtime = ""
+    if init_state_store():
+        try:
+            raw_runtime = str(STATE_DB_STORE.read_state("runtime.gemini_rows_json") or "").strip()
+        except Exception:
+            raw_runtime = ""
+    if not raw_runtime:
+        try:
+            raw_runtime = str(DISPATCH_RUNTIME_ROWS_FILE.read_text(encoding="utf-8") or "").strip()
+        except Exception:
+            raw_runtime = ""
     if not raw_runtime:
         return []
     try:
         parsed_runtime = json.loads(raw_runtime)
     except Exception:
         return []
-    return normalize_editor_rows_payload(parsed_runtime, start_folder) if isinstance(parsed_runtime, list) else []
+    if not isinstance(parsed_runtime, list):
+        return []
+    folder_hint = str(start_folder or "").strip()
+    rebuild_targets = folder_hint not in {"", "-"}
+    return normalize_editor_rows_payload(parsed_runtime, folder_hint, rebuild_targets=rebuild_targets)
 
 
 def build_dispatch_status_table_text(start_folder: str) -> str:
     folder_hint = str(start_folder or "").strip()
-    if not folder_hint or folder_hint in {"", "-"}:
-        return ""
     with dispatch_lock:
         runtime_rows = [dict(row) for row in dispatch_runtime_rows]
     if not runtime_rows:
@@ -6041,12 +6169,11 @@ def index():
             settings_ai_query_disabled=parse_form_bool(runtime_settings.get("ai_query_disabled", "1")),
             settings_start_on_boot=parse_form_bool(runtime_settings.get("start_on_boot", "1")),
             settings_skip_4k_h265_encode=parse_form_bool(runtime_settings.get("skip_4k_h265_encode", "0")),
-            settings_encode_once_4k=parse_form_bool(runtime_settings.get("encode_once_4k", "1")),
-            settings_one_encode_per_worker=parse_form_bool(runtime_settings.get("one_encode_per_worker", "0")),
-            settings_allow_worker_4=parse_form_bool(runtime_settings.get("allow_worker_4", "0")),
-            settings_parallel_job_limit=str(runtime_settings.get("parallel_job_limit", "2") or "2"),
-            settings_precheck_egb=parse_form_bool(runtime_settings.get("precheck_egb", "1")),
-            settings_speed_fallback_copy=parse_form_bool(runtime_settings.get("speed_fallback_copy", "1")),
+            settings_one_encode_per_worker=parse_form_bool(runtime_settings.get("one_encode_per_worker", "1")),
+            settings_allow_worker_4=parse_form_bool(runtime_settings.get("allow_worker_4", "1")),
+            settings_precheck_egb=parse_form_bool(runtime_settings.get("precheck_egb", "0")),
+            settings_speed_fallback_copy=parse_form_bool(runtime_settings.get("speed_fallback_copy", "0")),
+            settings_show_host_storage_controls=platform.system().strip().lower() == "darwin",
             worker_names=[item.get("name", "") for item in read_worker_specs()],
             work_dir=str(WORK_DIR),
             temp_dir=str(TEMP_DIR),
@@ -7033,6 +7160,8 @@ def api_state():
     if active_workers and not bool(job_data.get("running")):
         worker_names = sorted({str(worker.get("name", "") or "").strip() for worker in active_workers if str(worker.get("name", "") or "").strip()})
         if worker_names:
+            job_data["exists"] = True
+            job_data["job_id"] = "live-workers"
             job_data["running"] = True
             job_data["mode"] = "ffmpeg"
             job_data["worker_name"] = ", ".join(worker_names)
@@ -7057,7 +7186,7 @@ def api_state():
             status_table_text = str(active_workers[0].get("status_table_text", "") or "").strip()
         else:
             status_table_text = str(active_workers[0].get("status_table_text", "") or "").strip()
-    elif dispatch_data and dispatch_status_table:
+    elif dispatch_status_table:
         status_table_text = dispatch_status_table
     if not processing_log_text and active_workers:
         processing_log_text = build_live_processing_log_from_workers(worker_states)
@@ -7095,8 +7224,6 @@ def api_state():
             ),
             "nas_ip": runtime_settings.get("nas_ip", DEFAULT_NAS_IP),
             "plex_ip": runtime_settings.get("plex_ip", DEFAULT_PLEX_IP),
-            "encode_once_4k": runtime_settings.get("encode_once_4k", "1"),
-            "parallel_job_limit": runtime_settings.get("parallel_job_limit", "2"),
             "initial_setup_done": parse_form_bool(runtime_settings.get("initial_setup_done", "1")),
             "initial_setup_required": parse_form_bool(runtime_settings.get("initial_setup_required", "0")),
         },
@@ -7940,9 +8067,7 @@ LOG_WINDOW_TEMPLATE = """
       { key: "analyze", label: "Analyze" },
       { key: "copy", label: "Copy" },
       { key: "encode", label: "Encode" },
-      { key: "sync_nas", label: "Sync NAS" },
       { key: "sync_plex", label: "Sync Plex" },
-      { key: "del_out", label: "Lösche OUT" },
       { key: "del_source", label: "Lösche Quelle" },
     ];
 
@@ -8477,7 +8602,7 @@ LOG_WINDOW_TEMPLATE = """
           };
 
       const selectedKeys = [];
-      if (modeRaw === 'analyze' || modeRaw === 'copy' || modeRaw === 'ffmpeg') selectedKeys.push('analyze');
+      if (modeRaw === 'analyze') selectedKeys.push('analyze');
       if (modeRaw === 'copy') selectedKeys.push('copy');
       if (modeRaw === 'ffmpeg') selectedKeys.push('encode');
       if (opts.sync_nas) selectedKeys.push('sync_nas');
@@ -13659,17 +13784,21 @@ TEMPLATE = """
       justify-content: space-between;
       gap: 10px;
       margin-bottom: 0;
+      flex-wrap: wrap;
     }
     .worker-head-main {
       display: inline-flex;
       align-items: center;
       gap: 10px;
       min-width: 0;
+      flex: 1 1 auto;
+      white-space: nowrap;
     }
     .worker-name {
       font-weight: 700;
       letter-spacing: 0.02em;
       color: #f4f7ff;
+      white-space: nowrap;
     }
     .worker-dot {
       width: 12px;
@@ -13701,6 +13830,7 @@ TEMPLATE = """
     .worker-menu {
       margin: 0;
       margin-left: auto;
+      flex: 0 0 auto;
     }
     .worker-menu[open] .worker-menu-btn {
       background: rgba(43, 67, 112, 0.95);
@@ -13708,25 +13838,37 @@ TEMPLATE = """
     }
     .worker-menu-btn {
       list-style: none;
-      width: 34px;
-      height: 34px;
+      width: 42px;
+      height: 42px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      border-radius: 10px;
+      border-radius: 12px;
       border: 1px solid rgba(113, 156, 255, 0.28);
       background: rgba(26, 36, 54, 0.96);
       color: #dce7ff;
       cursor: pointer;
       user-select: none;
-      font-size: 16px;
-      font-weight: 600;
+      font-size: 23px;
+      font-weight: 800;
+      line-height: 1;
+      box-shadow: 0 8px 18px rgba(10, 18, 34, 0.24);
     }
     .worker-menu-btn::-webkit-details-marker {
       display: none;
     }
     .worker-menu-content {
-      margin-top: 10px;
+      margin-top: 12px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: flex-start;
+      flex-direction: column;
+      gap: 12px;
+      flex: 0 0 100%;
+      width: 100%;
+    }
+    .worker-menu:not([open]) + .worker-menu-content {
+      display: none;
     }
     .worker-actions {
       display: flex;
@@ -13734,6 +13876,9 @@ TEMPLATE = """
       gap: 8px;
       overflow-x: auto;
       padding-bottom: 2px;
+      justify-content: flex-start;
+      margin-left: 0;
+      width: 100%;
     }
     .worker-actions button {
       padding: 7px 10px;
@@ -13781,10 +13926,27 @@ TEMPLATE = """
       color: #8fa0c2;
     }
     .worker-meta {
+      display: flex;
+      align-items: center;
+      flex: 0 0 auto;
+      min-height: 0;
       font-size: 11px;
       color: #8fa0c2;
-      min-height: 0;
-      margin-bottom: 10px;
+      margin: 0;
+      white-space: nowrap;
+    }
+    @media (max-width: 980px) {
+      .worker-menu-content {
+        align-items: stretch;
+      }
+      .worker-meta {
+        flex-basis: 100%;
+        min-height: 0;
+      }
+      .worker-actions {
+        width: 100%;
+        margin-left: 0;
+      }
     }
   </style>
 </head>
@@ -13825,15 +13987,15 @@ TEMPLATE = """
               </div>
               <details class="worker-menu">
                 <summary class="worker-menu-btn" title="Worker-Aktionen" aria-label="Worker-Aktionen">&#9881;</summary>
-                <div class="worker-menu-content">
-                  <div class="worker-meta" data-worker-meta="{{ worker_name }}"></div>
-                  <div class="worker-actions">
-                    <button type="button" class="worker-action-kill" data-worker-name="{{ worker_name }}" data-worker-action="kill" onclick="controlWorker('{{ worker_name }}','kill')">Kill</button>
-                    <button type="button" class="worker-action-init" data-worker-name="{{ worker_name }}" data-worker-action="init" onclick="controlWorker('{{ worker_name }}','init')">Init</button>
-                    <button type="button" class="worker-action-pause" data-worker-name="{{ worker_name }}" data-worker-action="pause" onclick="controlWorker('{{ worker_name }}','pause')">Pause</button>
-                  </div>
-                </div>
               </details>
+              <div class="worker-menu-content">
+                <div class="worker-meta" data-worker-meta="{{ worker_name }}"></div>
+                <div class="worker-actions">
+                  <button type="button" class="worker-action-kill" data-worker-name="{{ worker_name }}" data-worker-action="kill" onclick="controlWorker('{{ worker_name }}','kill')">Kill</button>
+                  <button type="button" class="worker-action-init" data-worker-name="{{ worker_name }}" data-worker-action="init" onclick="controlWorker('{{ worker_name }}','init')">Init</button>
+                  <button type="button" class="worker-action-pause" data-worker-name="{{ worker_name }}" data-worker-action="pause" onclick="controlWorker('{{ worker_name }}', this.getAttribute('data-worker-action'))">Pause</button>
+                </div>
+              </div>
             </div>
           </div>
           {% endfor %}
@@ -13874,9 +14036,7 @@ TEMPLATE = """
               <button type="button" id="modeEncodeBtn" class="mode-btn mode-encode" onclick="setModeControls('ffmpeg')">Encode</button>
             </div>
             <div class="mode-option-buttons">
-              <button type="button" id="syncNasBtn" class="opt-btn" onclick="togglePostOption('sync_nas')">Sync NAS</button>
               <button type="button" id="syncPlexBtn" class="opt-btn" onclick="togglePostOption('sync_plex')">Sync Plex</button>
-              <button type="button" id="delOutBtn" class="opt-btn" onclick="togglePostOption('del_out')">&#128465; __OUT</button>
               <button type="button" id="delSourceBtn" class="opt-btn" onclick="togglePostOption('del_source')">&#128465; Quelle</button>
             </div>
           </div>
@@ -14047,17 +14207,13 @@ TEMPLATE = """
               <input id="startOnBootSetting" type="checkbox"{% if settings_start_on_boot %} checked{% endif %} />
               Beim Booten starten
             </label>
-            <label class="settings-toggle-label" for="encodeOnce4kSetting">
-              <input id="encodeOnce4kSetting" type="checkbox"{% if settings_encode_once_4k %} checked{% endif %} />
-              1x Encode bei 4k
-            </label>
             <label class="settings-toggle-label" for="oneEncodePerWorkerSetting">
               <input id="oneEncodePerWorkerSetting" type="checkbox"{% if settings_one_encode_per_worker %} checked{% endif %} />
               Nur 1 Encode pro Worker
             </label>
             <label class="settings-toggle-label" for="allowWorker4Setting">
               <input id="allowWorker4Setting" type="checkbox"{% if settings_allow_worker_4 %} checked{% endif %} />
-              4.Worker erlauben
+              4. Worker erlauben
             </label>
             <label class="settings-toggle-label" for="precheckEgbSetting">
               <input id="precheckEgbSetting" type="checkbox"{% if settings_precheck_egb %} checked{% endif %} />
@@ -14072,6 +14228,7 @@ TEMPLATE = """
           <label for="plexIpSetting">Plex IP</label>
           <input id="plexIpSetting" value="{{ settings_plex_ip }}" placeholder="192.168.52.5" />
 
+          {% if settings_show_host_storage_controls %}
           <label for="nasIpSetting">NAS IP</label>
           <input id="nasIpSetting" value="{{ settings_nas_ip }}" placeholder="192.168.52.4" />
 
@@ -14080,6 +14237,7 @@ TEMPLATE = """
             <input id="targetNfsSetting" value="{{ settings_target_nfs_path }}" placeholder="/Volumes/Data/Movie/" />
             <button type="button" onclick="openTargetNfsBrowse()" title="Verzeichnis-Auswahl" aria-label="Verzeichnis-Auswahl">&#128193;</button>
           </div>
+          {% endif %}
 
           <label for="targetOutSetting">Ziel __OUT</label>
           <div class="path-row">
@@ -14094,9 +14252,6 @@ TEMPLATE = """
             <button type="button" onclick="openTargetReenqueueBrowse()" title="Verzeichnis-Auswahl" aria-label="Verzeichnis-Auswahl">&#128193;</button>
             <button type="button" onclick="setTargetReenqueueDefault()" title="Standard setzen" aria-label="Standard setzen">Default</button>
           </div>
-
-          <label for="parallelJobLimitSetting">Parallele Jobs</label>
-          <input id="parallelJobLimitSetting" type="number" min="1" max="4" step="1" value="{{ settings_parallel_job_limit }}" />
         </div>
         <details class="settings-secrets">
           <summary>Advanced</summary>
@@ -14201,6 +14356,7 @@ TEMPLATE = """
     let updateStatusPollHandle = null;
     let lastKnownJobFolder = '';
     let bypassStartConfirmOnce = false;
+    let suppressIdleRunHistory = false;
     let initialSetupRequired = false;
     let initialSetupDone = true;
     let initialSetupNoticeShown = false;
@@ -14221,9 +14377,7 @@ TEMPLATE = """
       { key: 'analyze', label: 'Analyze' },
       { key: 'copy', label: 'Copy' },
       { key: 'encode', label: 'Encode' },
-      { key: 'sync_nas', label: 'Sync NAS' },
       { key: 'sync_plex', label: 'Sync Plex' },
-      { key: 'del_out', label: 'Lösche OUT' },
       { key: 'del_source', label: 'Lösche Quelle' },
     ];
     const statusTableState = {
@@ -14407,12 +14561,13 @@ TEMPLATE = """
         }
         document.querySelectorAll(`[data-worker-name="${name}"][data-worker-action]`).forEach((btn) => {
           const action = String(btn.getAttribute('data-worker-action') || '').trim().toLowerCase();
+          const state = String(worker.state || '').trim().toLowerCase();
           if (worker.reinit_running) {
             btn.disabled = action !== 'kill';
             return;
           }
-          if (action === 'pause') {
-            btn.disabled = !worker.connected || !worker.enabled;
+          if (action === 'pause' || action === 'resume') {
+            btn.disabled = !worker.connected;
             return;
           }
           if (action === 'init') {
@@ -14424,6 +14579,13 @@ TEMPLATE = """
             btn.disabled = !hasContainerRef;
           }
         });
+        const pauseBtn = document.querySelector(`[data-worker-name="${name}"][data-worker-action="pause"], [data-worker-name="${name}"][data-worker-action="resume"]`);
+        if (pauseBtn) {
+          const paused = String(worker.state || '').trim().toLowerCase() === 'paused';
+          pauseBtn.setAttribute('data-worker-action', paused ? 'resume' : 'pause');
+          pauseBtn.innerText = paused ? 'Resume' : 'Pause';
+          pauseBtn.disabled = !worker.connected || (!worker.enabled && !paused);
+        }
       });
     }
 
@@ -14486,6 +14648,26 @@ TEMPLATE = """
           window.history.replaceState({}, '', next);
         }
       }
+    }
+
+    function clearDisplayedRunPanels() {
+      const statusSummaryBox = document.getElementById('statusSummaryBox');
+      if (statusSummaryBox) {
+        renderSummaryInlineBox('');
+      }
+      setSummaryDetailsVisible(false);
+      renderStatusTable('', true);
+      setPreText('summaryBox', '', false);
+      setPreText('statusBox', '', false);
+      setPreText('procBox', '', false);
+    }
+
+    function resetIdleRunHistoryPreview() {
+      if (lastJobRunning) return;
+      suppressIdleRunHistory = true;
+      clearDisplayedRunPanels();
+      renderSummaryAmpel();
+      applyIdlePanelLayout(true);
     }
 
     function lockPre(id, ms = 3000) {
@@ -15152,7 +15334,7 @@ TEMPLATE = """
           };
 
       const selectedKeys = [];
-      if (modeRaw === 'analyze' || modeRaw === 'copy' || modeRaw === 'ffmpeg') selectedKeys.push('analyze');
+      if (modeRaw === 'analyze') selectedKeys.push('analyze');
       if (modeRaw === 'copy') selectedKeys.push('copy');
       if (modeRaw === 'ffmpeg') selectedKeys.push('encode');
       if (opts.sync_nas) selectedKeys.push('sync_nas');
@@ -15994,6 +16176,9 @@ TEMPLATE = """
       if (delSourceConfirmed) delSourceConfirmed.value = '0';
       applyPostOptionUI();
       applyInitialSetupUi(lastJobRunning);
+      if (persist && !lastJobRunning) {
+        resetIdleRunHistoryPreview();
+      }
       renderSummaryAmpel();
       if (persist) {
         persistModeSelection(normalized);
@@ -16593,10 +16778,8 @@ TEMPLATE = """
       const aiQueryDisabled = document.getElementById('aiQueryDisabledSetting');
       const startOnBoot = document.getElementById('startOnBootSetting');
       const skip4kH265Encode = document.getElementById('skip4kH265EncodeSetting');
-      const encodeOnce4k = document.getElementById('encodeOnce4kSetting');
       const oneEncodePerWorker = document.getElementById('oneEncodePerWorkerSetting');
       const allowWorker4 = document.getElementById('allowWorker4Setting');
-      const parallelJobLimit = document.getElementById('parallelJobLimitSetting');
       const precheckEgb = document.getElementById('precheckEgbSetting');
       const speedFallbackCopy = document.getElementById('speedFallbackCopySetting');
 
@@ -16627,17 +16810,11 @@ TEMPLATE = """
       if (skip4kH265Encode) {
         skip4kH265Encode.checked = parseBoolSetting(data.skip_4k_h265_encode);
       }
-      if (encodeOnce4k) {
-        encodeOnce4k.checked = parseBoolSetting(data.encode_once_4k);
-      }
       if (oneEncodePerWorker) {
         oneEncodePerWorker.checked = parseBoolSetting(data.one_encode_per_worker);
       }
       if (allowWorker4) {
         allowWorker4.checked = parseBoolSetting(data.allow_worker_4);
-      }
-      if (parallelJobLimit) {
-        parallelJobLimit.value = String(data.parallel_job_limit || '2').trim() || '2';
       }
       if (precheckEgb) {
         precheckEgb.checked = parseBoolSetting(data.precheck_egb);
@@ -16689,10 +16866,8 @@ TEMPLATE = """
       const aiQueryDisabled = document.getElementById('aiQueryDisabledSetting');
       const startOnBoot = document.getElementById('startOnBootSetting');
       const skip4kH265Encode = document.getElementById('skip4kH265EncodeSetting');
-      const encodeOnce4k = document.getElementById('encodeOnce4kSetting');
       const oneEncodePerWorker = document.getElementById('oneEncodePerWorkerSetting');
       const allowWorker4 = document.getElementById('allowWorker4Setting');
-      const parallelJobLimit = document.getElementById('parallelJobLimitSetting');
       const precheckEgb = document.getElementById('precheckEgbSetting');
       const speedFallbackCopy = document.getElementById('speedFallbackCopySetting');
       const encoder = document.getElementById('encoderSetting');
@@ -16709,10 +16884,8 @@ TEMPLATE = """
         ai_query_disabled: !!(aiQueryDisabled && aiQueryDisabled.checked),
         start_on_boot: !!(startOnBoot && startOnBoot.checked),
         skip_4k_h265_encode: !!(skip4kH265Encode && skip4kH265Encode.checked),
-        encode_once_4k: !!(encodeOnce4k && encodeOnce4k.checked),
         one_encode_per_worker: !!(oneEncodePerWorker && oneEncodePerWorker.checked),
         allow_worker_4: !!(allowWorker4 && allowWorker4.checked),
-        parallel_job_limit: parallelJobLimit ? String(parallelJobLimit.value || '2').trim() : '2',
         precheck_egb: !!(precheckEgb && precheckEgb.checked),
         speed_fallback_copy: !!(speedFallbackCopy && speedFallbackCopy.checked),
       };
@@ -16820,14 +16993,7 @@ TEMPLATE = """
       } catch (err) {
       }
 
-      const statusSummaryBox = document.getElementById('statusSummaryBox');
-      if (statusSummaryBox) {
-        renderSummaryInlineBox('');
-      }
-      setSummaryDetailsVisible(false);
-      renderStatusTable('', true);
-      setPreText('statusBox', '', false);
-      setPreText('procBox', '', false);
+      clearDisplayedRunPanels();
       setPreText('planBox', '', false);
       if (!lastJobRunning) {
         applyIdlePanelLayout(true);
@@ -17948,6 +18114,9 @@ TEMPLATE = """
 
         const job = (data && data.job) ? data.job : {};
         const running = isJobRunningState(job);
+        if (running) {
+          suppressIdleRunHistory = false;
+        }
         const previousRunning = lastJobRunning;
         const previousMode = String(lastJobMode || '').trim().toLowerCase();
         const folderNow = normalizedJobFolder(job);
@@ -18053,11 +18222,29 @@ TEMPLATE = """
         if (settingsEncoder) {
           setEncoderControls(settingsEncoder);
         }
-        const liveMode = normalizeModeForAmpel(running ? (job.mode || '') : (settings.mode || job.mode || selectedMode || ''));
+        const liveMode = normalizeModeForAmpel(
+          running
+            ? (job.mode || '')
+            : (suppressIdleRunHistory ? (selectedMode || '') : (settings.mode || job.mode || selectedMode || ''))
+        );
         if (liveMode) {
           setModeControls(liveMode, false);
         }
         const statusSummaryBox = document.getElementById('statusSummaryBox');
+        if (!running && suppressIdleRunHistory) {
+          if (statusSummaryBox && !selectionLocked && !isPreLocked('statusSummaryBox')) {
+            renderSummaryInlineBox('');
+          }
+          renderSummaryAmpel();
+          setPreText('summaryBox', '', false);
+          if (!selectionLocked) {
+            renderStatusTable('', true);
+          }
+          setPreText('statusBox', '', false);
+          setPreText('procBox', '', false);
+          setPreText('planBox', data.out_tree, running);
+          return;
+        }
         if (statusSummaryBox && !selectionLocked && !isPreLocked('statusSummaryBox')) {
           renderSummaryInlineBox(statusParts.meta || '', summaryText);
         }

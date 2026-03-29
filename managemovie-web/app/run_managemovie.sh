@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-VERSION="0.2.45"
+VERSION="0.2.46"
 PY_SCRIPT="$SCRIPT_DIR/managemovie_v${VERSION}.py"
 FALLBACK_SCRIPT="$SCRIPT_DIR/managemovie.py"
 

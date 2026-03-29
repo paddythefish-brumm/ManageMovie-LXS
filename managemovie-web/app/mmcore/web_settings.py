@@ -36,9 +36,11 @@ def build_public_runtime_settings(
     gemini_api = str(settings.get("gemini_api", "") or "").strip()
     ai_query_disabled = parse_bool_flag(settings.get("ai_query_disabled", "1"))
     skip_4k_h265_encode = parse_bool_flag(settings.get("skip_4k_h265_encode", "0"))
-    precheck_egb = parse_bool_flag(settings.get("precheck_egb", "1"))
+    one_encode_per_worker = parse_bool_flag(settings.get("one_encode_per_worker", "1"))
+    allow_worker_4 = parse_bool_flag(settings.get("allow_worker_4", "1"))
+    precheck_egb = parse_bool_flag(settings.get("precheck_egb", "0"))
     start_on_boot = parse_bool_flag(settings.get("start_on_boot", "1"))
-    speed_fallback_copy = parse_bool_flag(settings.get("speed_fallback_copy", "1"))
+    speed_fallback_copy = parse_bool_flag(settings.get("speed_fallback_copy", "0"))
     initial_setup_done = parse_bool_flag(settings.get("initial_setup_done", "1"))
     initial_setup_required = parse_bool_flag(settings.get("initial_setup_required", "0"))
     return {
@@ -55,6 +57,8 @@ def build_public_runtime_settings(
         "has_gemini_api": bool(gemini_api),
         "ai_query_disabled": ai_query_disabled,
         "skip_4k_h265_encode": skip_4k_h265_encode,
+        "one_encode_per_worker": one_encode_per_worker,
+        "allow_worker_4": allow_worker_4,
         "precheck_egb": precheck_egb,
         "start_on_boot": start_on_boot,
         "speed_fallback_copy": speed_fallback_copy,
