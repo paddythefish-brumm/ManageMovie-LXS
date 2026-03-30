@@ -5034,6 +5034,9 @@ def run_system_update_preflight(*, log: Callable[[str], None] | None = None) -> 
     failures: list[str] = []
     for spec in specs:
         name = str(spec.get("name", "") or "").strip() or "worker"
+        node = str(spec.get("node", "") or "").strip()
+        ctid = str(spec.get("ctid", "") or "").strip()
+        logger(f"[update] {name}: {node} CT{ctid}")
         logger(f"[update] {name} wird entfernt")
         ok, msg = run_worker_kill_sync(spec)
         if ok:
