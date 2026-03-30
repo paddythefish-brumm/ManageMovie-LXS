@@ -6537,6 +6537,15 @@ def schedule_system_update() -> tuple[bool, str]:
     update_log.parent.mkdir(parents=True, exist_ok=True)
     current_version = current_release_version()
     target_version = latest_known_release_version(project_root)
+    current_patch = parse_release_patch(current_version)
+    target_patch = parse_release_patch(target_version)
+
+    if target_patch < VERSION_MIN_PATCH:
+        update_requested_at = 0.0
+        return False, "Kein Update verfügbar."
+    if target_patch <= current_patch:
+        update_requested_at = 0.0
+        return False, f"Kein Update verfügbar. Installiert ist bereits v{current_version}."
 
     python_bin = (sys.executable or shutil.which("python3") or "python3").strip() or "python3"
     app_script = Path(__file__).resolve()
@@ -6990,6 +6999,11 @@ def api_system_update_status():
     update_debug_log = LOG_DIR / "system-update-debug.log"
     raw_log_text = tail_file(update_log, lines=360, max_chars=120000)
     raw_debug_log_text = tail_file(update_debug_log, lines=360, max_chars=120000)
+    current_version = current_release_version()
+    target_version = latest_known_release_version(BASE_DIR.parent)
+    current_patch = parse_release_patch(current_version)
+    target_patch = parse_release_patch(target_version)
+    update_available = target_patch >= VERSION_MIN_PATCH and target_patch > current_patch
     log_text = clean_update_display_log(raw_log_text)
     debug_log_text = clean_update_debug_log(raw_debug_log_text)
     log_exists = update_log.exists()
@@ -7041,6 +7055,9 @@ def api_system_update_status():
     return jsonify(
         {
             "ok": True,
+            "current_version": current_version,
+            "target_version": target_version,
+            "update_available": update_available,
             "running": running,
             "can_abort": running,
             "done": done,
@@ -15931,11 +15948,42 @@ TEMPLATE = """
         const res = await fetch('/api/system/update-status', { cache: 'no-store' });
         const data = await res.json().catch(() => ({}));
         const running = !!(data && data.running);
+        const currentVersion = String((data && data.current_version) || modalVersion || '').trim();
+        const targetVersion = String((data && data.target_version) || '').trim();
+        const updateAvailable = !!(data && data.update_available);
         if (running) {
           openUpdateProgressModal();
           await refreshUpdateProgressStatus(true);
           return;
         }
+        if (!updateAvailable) {
+          askBrowserConfirm(
+            `Kein Update verfügbar. Installiert ist bereits v${currentVersion || '-'}.`,
+            'Update',
+            {
+              cancelLabel: 'Zurück',
+              okLabel: 'OK',
+              okClass: 'btn-primary',
+            },
+          );
+          return;
+        }
+        const targetHint = targetVersion ? `v${targetVersion}` : 'das neueste Release';
+        askBrowserConfirm(
+          `Neuestes Release von GitHub holen und die App danach sauber neu starten?\n\nZiel: ${targetHint}`,
+          'Update bestätigen',
+          {
+            cancelLabel: 'Zurück',
+            okLabel: 'Update',
+            okClass: 'btn-primary',
+            apply: (ok) => {
+              if (ok) {
+                confirmUpdate();
+              }
+            },
+          },
+        );
+        return;
       } catch (err) {
       }
       askBrowserConfirm(
