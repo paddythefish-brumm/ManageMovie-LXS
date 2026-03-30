@@ -3188,10 +3188,39 @@ def highest_release_version(values: list[str]) -> str:
     return format_release_version(best_patch)
 
 
+def detect_update_remote_url(project_root: Path | None = None) -> str:
+    root = project_root or BASE_DIR.parent
+    if shutil.which("git"):
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            origin_url = str(result.stdout or "").strip()
+            if result.returncode == 0 and origin_url:
+                return origin_url
+        except Exception:
+            pass
+    env_local = root / ".env.local"
+    try:
+        env_text = env_local.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        env_text = ""
+    if re.search(r"ManageMovie\s+LXS", env_text, flags=re.IGNORECASE):
+        return "https://github.com/paddythefish-brumm/ManageMovie-LXS.git"
+    if platform.system() == "Darwin":
+        return "https://github.com/paddythefish-brumm/ManageMovie.git"
+    return "https://github.com/paddythefish-brumm/ManageMovie-LXS.git"
+
+
 def latest_known_release_version(project_root: Path | None = None) -> str:
     root = project_root or BASE_DIR.parent
+    remote_url = detect_update_remote_url(root)
     commands = (
-        ["git", "-C", str(root), "ls-remote", "--tags", "--refs", "origin", "v*"],
+        ["git", "ls-remote", "--tags", "--refs", remote_url, "v*"],
         ["git", "-C", str(root), "tag", "--list", "v*"],
     )
     candidates: list[str] = []
