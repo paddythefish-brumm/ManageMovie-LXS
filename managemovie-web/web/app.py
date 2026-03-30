@@ -6596,9 +6596,10 @@ PY
 }}
 run_update_phase() {{
   local phase="$1"
+  local heartbeat_message="$2"
   local phase_log
   phase_log="$(mktemp)"
-  MANAGEMOVIE_SKIP_DB_INIT=1 PYTHONWARNINGS=ignore::SyntaxWarning {q_python} - {q_app} "$phase" > "$phase_log" 2>&1 <<'PY'
+  MANAGEMOVIE_SKIP_DB_INIT=1 PYTHONWARNINGS=ignore::SyntaxWarning {q_python} - {q_app} "$phase" > "$phase_log" 2>&1 <<'PY' &
 import importlib.util
 import pathlib
 import sys
@@ -6626,13 +6627,37 @@ else:
 print(f"[update] {{msg}}", flush=True)
 raise SystemExit(0 if ok else 1)
 PY
-  local rc=$?
-  cat "$phase_log" >> {q_debug_log} 2>&1 || true
-  while IFS= read -r line || [ -n "$line" ]; do
+  local phase_pid=$!
+  tail -n +1 -f --pid="$phase_pid" "$phase_log" 2>/dev/null | while IFS= read -r line || [ -n "$line" ]; do
     route_phase_output "$line"
-  done < "$phase_log"
+  done &
+  local tail_pid=$!
+  while kill -0 "$phase_pid" >/dev/null 2>&1; do
+    sleep 30
+    if kill -0 "$phase_pid" >/dev/null 2>&1; then
+      display_line "$heartbeat_message"
+    fi
+  done
+  wait "$phase_pid"
+  local rc=$?
+  wait "$tail_pid" 2>/dev/null || true
+  cat "$phase_log" >> {q_debug_log} 2>&1 || true
   rm -f "$phase_log"
   return $rc
+}}
+run_logged_command_with_heartbeat() {{
+  local heartbeat_message="$1"
+  shift
+  "$@" >> {q_debug_log} 2>&1 &
+  local cmd_pid=$!
+  while kill -0 "$cmd_pid" >/dev/null 2>&1; do
+    sleep 30
+    if kill -0 "$cmd_pid" >/dev/null 2>&1; then
+      display_line "$heartbeat_message"
+    fi
+  done
+  wait "$cmd_pid"
+  return $?
 }}
 display_line "Update gestartet"
 status_line "[update-status] running"
@@ -6640,9 +6665,9 @@ if [ -n "$current_version" ]; then
   display_line "Aktuell installiert: v$current_version"
 fi
 if [ -n "$target_version" ]; then
-  display_line "Ziel-Release: v$target_version"
+  display_line "Verfügbares Release: v$target_version"
 else
-  display_line "Ziel-Release wird geprüft"
+  display_line "Verfügbares Release wird geprüft"
 fi
 if [ -f {q_update} ] && [ ! -x {q_update} ]; then
   chmod +x {q_update} >> {q_debug_log} 2>&1 || true
@@ -6653,7 +6678,7 @@ if [ ! -x {q_update} ]; then
   exit 1
 fi
 display_line "Vorbereitungen laufen"
-run_update_phase pre
+run_update_phase pre "Vorbereitungen laufen weiter"
 rc=$?
 if [ "$rc" -ne 0 ]; then
   display_line "Das Update wurde vor dem Einspielen abgebrochen."
@@ -6665,7 +6690,7 @@ if [ -n "$target_version" ]; then
 else
   display_line "Das neue Release wird eingespielt"
 fi
-{q_update} >> {q_debug_log} 2>&1
+run_logged_command_with_heartbeat "Das Release wird weiterhin eingespielt" {q_update}
 rc=$?
 if [ "$rc" -ne 0 ]; then
   display_line "Das Release konnte nicht installiert werden."
@@ -6695,7 +6720,7 @@ else
   display_line "Das Release ist installiert"
 fi
 display_line "Backup und Worker-Neustart laufen"
-run_update_phase post
+run_update_phase post "Backup und Worker-Neustart laufen weiter"
 rc=$?
 if [ "$rc" -ne 0 ]; then
   display_line "Das Release ist installiert, aber der LXS-Nachlauf ist fehlgeschlagen."
@@ -6752,21 +6777,28 @@ def append_update_progress_line(message: str, *, debug: bool = False) -> None:
         pass
 
 
-def route_update_display_line(handle: Any, message: str) -> None:
+def normalize_update_display_message(message: str) -> str | None:
     text = str(message or "").strip()
     if not text:
-        return
+        return None
     if "SyntaxWarning: invalid escape sequence" in text:
-        return
+        return None
     if text.lstrip().startswith("let m = text.match("):
-        return
+        return None
     if "MariaDB-State nicht verfuegbar" in text:
-        return
+        return None
     if text.startswith("[update] "):
         text = text[len("[update] "):].strip()
     elif text.startswith("[WARN] "):
         text = "WARN: " + text[len("[WARN] "):].strip()
     elif text.startswith("[update-status] "):
+        return None
+    return text
+
+
+def route_update_display_line(handle: Any, message: str) -> None:
+    text = normalize_update_display_message(message)
+    if not text:
         return
     timestamp = time.strftime("%H:%M:%S")
     handle.write(f"[{timestamp}] {text}\n")
@@ -6814,6 +6846,29 @@ def clean_update_debug_log(text: str) -> str:
             continue
         cleaned.append(line)
     return "\n".join(cleaned).strip()
+
+
+def is_system_update_runtime_active() -> bool:
+    checks: list[list[str]] = []
+    if shutil.which("systemctl"):
+        checks.append(["systemctl", "is-active", "--quiet", UPDATE_UNIT_NAME])
+    if shutil.which("pgrep"):
+        checks.append(["pgrep", "-f", "system-update-launcher.sh"])
+        checks.append(["pgrep", "-f", "update_ManageMovie.sh"])
+    for cmd in checks:
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+            if int(result.returncode) == 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def abort_system_update() -> tuple[bool, str]:
@@ -7006,6 +7061,25 @@ def api_system_update_status():
     update_available = target_patch >= VERSION_MIN_PATCH and target_patch > current_patch
     log_text = clean_update_display_log(raw_log_text)
     debug_log_text = clean_update_debug_log(raw_debug_log_text)
+    if raw_debug_log_text:
+        merged_lines = log_text.splitlines() if log_text else []
+        seen_messages: set[str] = set()
+        for raw in merged_lines:
+            normalized = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", str(raw or "").strip()).strip()
+            if normalized:
+                seen_messages.add(normalized)
+        appended = False
+        timestamp = time.strftime("%H:%M:%S")
+        for raw in raw_debug_log_text.splitlines():
+            normalized = normalize_update_display_message(raw)
+            if not normalized or normalized in seen_messages:
+                continue
+            merged_lines.append(f"[{timestamp}] {normalized}")
+            seen_messages.add(normalized)
+            appended = True
+        if appended:
+            log_text = "\n".join(merged_lines).strip()
+    runtime_active = is_system_update_runtime_active()
     log_exists = update_log.exists()
     debug_log_exists = update_debug_log.exists()
     log_size = 0
@@ -7047,10 +7121,14 @@ def api_system_update_status():
                 success = return_code == 0
             else:
                 running = True
-    if log_exists and not done and log_mtime > 0:
+    if log_exists and not done and log_mtime > 0 and runtime_active:
         # Nach einem App-Neustart ist der Speicherzustand weg. Frischer Log ohne done-Marker bleibt laufend.
         if (time.time() - log_mtime) < 900:
             running = True
+    if done:
+        running = False
+    elif not runtime_active:
+        running = False
 
     return jsonify(
         {
@@ -7059,7 +7137,7 @@ def api_system_update_status():
             "target_version": target_version,
             "update_available": update_available,
             "running": running,
-            "can_abort": running,
+            "can_abort": running and runtime_active,
             "done": done,
             "success": success,
             "return_code": return_code,
